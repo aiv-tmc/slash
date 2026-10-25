@@ -8,14 +8,15 @@
 //! the mempool; the returned transaction id is the content-based id the
 //! mempool uses, so wallets can track their submission through
 //! `getMempool` without a second id scheme. The treasury quote handlers
-//! evaluate the curve at the chain's current position and report that
-//! position alongside the unsigned transaction: the quote is valid
-//! exactly at the reported curve position, and the treasury signer
-//! re-verifies the price at signing time, because every earlier pair in
-//! the block advances the position the execution prices against.
+//! live in `quotes.rs` and are re-exported here under the names the
+//! dispatch table calls.
 
 use super::{RpcError, RpcShared};
 use serde_json::{json, Value};
+
+#[path = "quotes.rs"]
+mod quotes;
+pub(super) use quotes::{handle_build_treasury_buy, handle_build_treasury_sell};
 
 /// The maximum number of transactions the getMempool response renders.
 /// The queue depth is reported before truncation so fee estimation keeps
@@ -23,7 +24,7 @@ use serde_json::{json, Value};
 const MEMPOOL_RESPONSE_CAP: usize = 100;
 
 /// Decoded request parameters: a hex-encoded address at `index`.
-fn decode_address(params: &Value, index: usize) -> Result<[u8; 32], RpcError> {
+pub(super) fn decode_address(params: &Value, index: usize) -> Result<[u8; 32], RpcError> {
     let hex_str = params
         .get(index)
         .and_then(Value::as_str)
@@ -193,138 +194,27 @@ pub(super) async fn handle_get_treasury_state(_params: &Value) -> Result<Value, 
     }))
 }
 
-/// buildTreasuryBuy: price an amount of treasury cells and return the
-/// unsigned mint transaction that the treasury signer must sign. The
-/// quoted cost is evaluated at the chain's current curve position, which
-/// the response reports as `price_position`: the quote holds exactly at
-/// that position, and the signer re-verifies the price at signing time,
-/// because every earlier pair included in the block advances the
-/// position the execution prices against.
-pub(super) async fn handle_build_treasury_buy(params: &Value) -> Result<Value, RpcError> {
-    let buyer = decode_address(params, 0)?;
-    let amount = params
-        .get(1)
-        .and_then(|v| v.as_u64())
-        .ok_or_else(|| RpcError::invalid_params("missing or invalid amount parameter"))?;
-    if amount < crate::state::MIN {
-        return Err(RpcError::invalid_params(
-            "amount is below the minimum transaction size",
-        ));
-    }
-    if amount > crate::state::N {
-        return Err(RpcError::invalid_params(
-            "amount exceeds the total cell supply",
-        ));
-    }
-    let chain = crate::cached_load();
-    let cost = crate::treasury::buy_price(amount, chain.state.total_sold);
-    let mint_inputs = chain
-        .state
-        .select_single(crate::state::TREASURY, amount)
-        .ok_or_else(|| RpcError::invalid_tx("treasury cannot fund this mint"))?;
-    let mint_tx = crate::chain::Tx {
-        from: crate::state::TREASURY,
-        inputs: vec![mint_inputs],
-        outputs: vec![crate::chain::Output {
-            start: mint_inputs.0,
-            end: mint_inputs.1,
-            to: buyer,
-            lock: None,
-        }],
-        sig: vec![],
-        scheme: 0,
-        // The memo stays empty: treasury pairs ride the pairing rule, not
-        // the governance payload channel.
-        memo: None,
-    };
-    let encoded_mint = bincode::serialize(&mint_tx)
-        .map_err(|_| RpcError::invalid_params("mint transaction serialization failed"))?;
-    Ok(json!({
-        "cost": cost,
-        "price_position": chain.state.total_sold,
-        "unsigned_mint_tx": hex::encode(encoded_mint),
-    }))
-}
-
-/// buildTreasurySell: price a sell-back and return the unsigned payout
-/// transaction that the treasury signer must sign, paying 98% of the curve
-/// price out of the treasury vault. Amounts whose payout rounds to zero
-/// are refused with a named error instead of an unpayable quote. The
-/// quoted payout is evaluated at the chain's current curve position and
-/// reported as `price_position`, exactly as the buy side reports it.
-pub(super) async fn handle_build_treasury_sell(params: &Value) -> Result<Value, RpcError> {
-    let seller = decode_address(params, 0)?;
-    let amount = params
-        .get(1)
-        .and_then(|v| v.as_u64())
-        .ok_or_else(|| RpcError::invalid_params("missing or invalid amount parameter"))?;
-    if amount == 0 {
-        return Err(RpcError::invalid_params("amount must be positive"));
-    }
-    if amount > crate::state::N {
-        return Err(RpcError::invalid_params(
-            "amount exceeds the total cell supply",
-        ));
-    }
-    let chain = crate::cached_load();
-    let payout = crate::treasury::sell_price(amount, chain.state.total_sold);
-    if payout == 0 {
-        return Err(RpcError::invalid_tx("payout rounds to zero"));
-    }
-    let (start, end) = chain
-        .state
-        .select_single(crate::state::TREASURY_VAULT, payout)
-        .ok_or_else(|| RpcError::invalid_tx("treasury vault cannot fund this payout"))?;
-    let payout_tx = crate::chain::Tx {
-        from: crate::state::TREASURY,
-        inputs: vec![(start, end)],
-        outputs: vec![crate::chain::Output {
-            start,
-            end,
-            to: seller,
-            lock: None,
-        }],
-        sig: vec![],
-        scheme: 0,
-        // The memo stays empty: treasury pairs ride the pairing rule, not
-        // the governance payload channel.
-        memo: None,
-    };
-    let encoded = bincode::serialize(&payout_tx)
-        .map_err(|_| RpcError::invalid_params("payout transaction serialization failed"))?;
-    Ok(json!({
-        "payout": payout,
-        "price_position": chain.state.total_sold,
-        "unsigned_payout_tx": hex::encode(encoded),
-    }))
-}
-
-/// stop: ask the node to shut down. The command travels the node command
-/// channel; an endpoint started without a configured channel reports a
-/// plain internal error instead of pretending the node heard it.
+/// stop: ask the node to shut down gracefully through the command channel.
+/// Endpoints started without node control answer with a named error.
 pub(super) async fn handle_stop(shared: &RpcShared) -> Result<Value, RpcError> {
-    match &shared.cmd {
-        Some(tx) => {
-            let _ = tx.send(crate::p2p::NodeCommand::Shutdown).await;
-            Ok(json!(true))
-        }
-        None => Err(RpcError::internal(
-            "node control channel is not configured on this endpoint",
-        )),
-    }
+    let cmd = shared
+        .cmd
+        .as_ref()
+        .ok_or_else(|| RpcError::internal("node control channel unavailable"))?;
+    cmd.send(crate::p2p::NodeCommand::Shutdown)
+        .await
+        .map_err(|_| RpcError::internal("command channel closed"))?;
+    Ok(json!("stopping"))
 }
 
-/// mine: ask the node to start a mining attempt. A node without a
-/// configured miner key validates the command but produces no block; the
-/// acceptance acknowledges only that the command reached the event loop.
+/// mine: ask the node to mine one block through the command channel.
 pub(super) async fn handle_mine(shared: &RpcShared) -> Result<Value, RpcError> {
-    match &shared.cmd {
-        Some(tx) => {
-            let _ = tx.send(crate::p2p::NodeCommand::Mine).await;
-            Ok(json!(true))
-        }
-        None => Err(RpcError::internal(
-            "node control channel is not configured on this endpoint",
-        )),
-    }
+    let cmd = shared
+        .cmd
+        .as_ref()
+        .ok_or_else(|| RpcError::internal("node control channel unavailable"))?;
+    cmd.send(crate::p2p::NodeCommand::Mine)
+        .await
+        .map_err(|_| RpcError::internal("command channel closed"))?;
+    Ok(json!("mining"))
 }

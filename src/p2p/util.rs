@@ -30,6 +30,16 @@ use super::limits::{PEER_BAN_BASE_SECS, PEER_BAN_MAX_SECS, PEER_BAN_STRIKES};
 /// framing is 36 bytes of multihash header plus the 32-byte key inside a
 /// protobuf field. Returns None for any other key type or a malformed
 /// encoding, so callers never trust an unauthenticated key.
+///
+/// The byte positions below are a structural dependency on libp2p's wire
+/// format: a dependency upgrade that changes the identity encoding
+/// silently degrades onion-key attestation from "verified" to
+/// "unverifiable" with no error surfacing anywhere. Two guards keep that
+/// diagnosable: every refusal logs the peer and the observed length, so
+/// operators can distinguish "the network has non-Ed25519 peers" from
+/// "our parser no longer matches the dependency", and the fixed test
+/// vector in this module's tests pins the exact layout so the upgrade
+/// that breaks the offsets fails CI loudly.
 pub fn peer_id_ed25519_key(peer: &PeerId) -> Option<[u8; 32]> {
     let bytes = peer.to_bytes();
     // Identity multihash: the multihash codec is 0x00 with the raw length,
@@ -43,6 +53,12 @@ pub fn peer_id_ed25519_key(peer: &PeerId) -> Option<[u8; 32]> {
         || bytes[4] != 0x12
         || bytes[5] != 32
     {
+        eprintln!(
+            "[p2p] peer {} does not carry an Ed25519 identity multihash \
+             (encoding length {}); onion attestation unverifiable for this peer",
+            peer,
+            bytes.len()
+        );
         return None;
     }
     let mut out = [0u8; 32];
@@ -133,6 +149,42 @@ mod tests {
         assert_eq!(peer_id_of(&addr), Some(peer));
         let bare: Multiaddr = "/ip4/203.0.113.10/tcp/30333".parse().unwrap();
         assert_eq!(peer_id_of(&bare), None);
+    }
+
+    #[test]
+    fn peer_id_ed25519_key_pins_the_identity_multihash_layout() {
+        // Pin the exact byte layout the parser depends on — codec 0x00,
+        // length 36, protobuf field 1 carrying the 32-byte key — so a
+        // libp2p upgrade that changes the identity encoding fails this
+        // test in CI instead of silently degrading onion attestation on
+        // every node at once.
+        let key = [7u8; 32];
+        // A raw 32-byte seed enters through libp2p's SecretKey decoder:
+        // Keypair::try_from_bytes expects the 64-byte expanded form, so
+        // the seed is decoded first and the keypair derived from it. The
+        // identity multihash then carries the derived Ed25519 public
+        // key, which is deterministic in the seed but never equals it.
+        // The public key bytes are derived through the crate's own
+        // Ed25519 implementation — the same RFC 8032 seed derivation
+        // libp2p performs — so the pinned vector holds without depending
+        // on libp2p's key-encoding API surface.
+        let mut seed = key;
+        let secret = libp2p::identity::ed25519::SecretKey::try_from_bytes(&mut seed)
+            .expect("seed bytes form a secret key");
+        let keypair = libp2p::identity::ed25519::Keypair::from(secret);
+        let public: [u8; 32] = crate::crypto::public_from_secret(&key);
+        let peer = libp2p::identity::PublicKey::from(keypair.public()).to_peer_id();
+        let mut expected = vec![0x00, 36, 0x08, 0x01, 0x12, 32];
+        expected.extend_from_slice(&public);
+        assert_eq!(
+            peer.to_bytes(),
+            expected,
+            "libp2p changed the identity multihash framing"
+        );
+        assert_eq!(peer_id_ed25519_key(&peer), Some(public));
+        // A peer id that is not an Ed25519 identity multihash — a random
+        // sha256-based id has a different codec and length — is refused.
+        assert_eq!(peer_id_ed25519_key(&PeerId::random()), None);
     }
 
     #[test]

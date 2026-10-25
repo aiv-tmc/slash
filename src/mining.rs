@@ -1,14 +1,13 @@
-// `mine_parallel` takes one parameter per mining input (header fields,
-// difficulty, cancellation flag, worker count, and the slot predicate).
-// The arity mirrors the consensus-mandated hash inputs; grouping would hide
-// the field list at call sites, so the arity lint is allowed deliberately
-// at module scope.
+// `mine_parallel` takes one parameter per mining input: the arity mirrors
+// the consensus-mandated hash field list, which grouping would hide at
+// call sites, so the arity lint is allowed at module scope.
 #![allow(clippy::too_many_arguments)]
 
 //! RandomX proof-of-work mining with parallel nonce search.
 //!
-//! The miner constructs hash inputs identically to `verify_pow` in chain.rs,
-//! so a nonce that satisfies the difficulty target is valid consensus-wide.
+//! The miner constructs hash inputs through the shared `chain::pow_input`
+//! builder — the same function the verifier uses — so a nonce that
+//! satisfies the difficulty target is valid consensus-wide by construction.
 
 use rust_randomx::{Context, Hasher as RandomXHasher};
 use std::collections::HashMap;
@@ -16,15 +15,22 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-/// One cache entry: the RandomX context plus the timestamp of its last use.
+/// One cache entry: the RandomX context, the timestamp of its last use,
+/// and whether the context holds the full dataset.
 struct CachedContext {
     context: Arc<Context>,
     last_used: Instant,
+    /// Whether the context holds the full RandomX dataset. Light
+    /// verification contexts are cheap to rebuild; full mining contexts
+    /// pin a large memory allocation and are expensive to recreate, so
+    /// the eviction policy uses this flag to protect the mining tip's
+    /// dataset from verification traffic.
+    full_mem: bool,
 }
 
-/// Global cache of RandomX contexts keyed by the block's `prev` hash.
-/// Context creation is expensive, so mining and verification reuse contexts
-/// across attempts that share the same `prev`.
+/// Global cache of RandomX contexts keyed by the block's `prev` hash, so
+/// mining and verification reuse the expensive contexts across attempts
+/// that share the same `prev`.
 static CONTEXT_CACHE: OnceLock<std::sync::Mutex<HashMap<[u8; 32], CachedContext>>> =
     OnceLock::new();
 
@@ -36,9 +42,21 @@ const CONTEXT_CACHE_TTL: Duration = Duration::from_secs(600);
 /// node memory by forcing the creation of unbounded contexts.
 const MAX_CONTEXT_CACHE_ENTRIES: usize = 8;
 
-/// Retrieve a cached RandomX Context for the given prev hash.
-/// Creates a new Context if none exists, and evicts entries older than 10 minutes.
-/// `full_mem` must be true for mining and may be false for verification.
+/// Hash evaluations between wall-clock refreshes inside the nonce loops.
+/// The proof-of-work input binds the one-second-resolution timestamp, so a
+/// search that outlives its starting second keeps hashing an input the
+/// consensus clock has already moved past. The interval is sized against
+/// the expected per-hash cost: frequent enough that the stamped time never
+/// lags the wall clock, rare enough that the clock read stays noise.
+const TIME_REFRESH_INTERVAL: u64 = 1 << 16;
+
+/// Retrieve a cached RandomX Context for the given prev hash, creating one
+/// when no live entry exists. `full_mem` must be true for mining and may be
+/// false for verification. Eviction prefers light verification contexts —
+/// they are cheap to rebuild, while evicting a full mining context forces a
+/// large reallocation before the next mining attempt can hash a single
+/// nonce, so header-sync verification traffic recycles verification entries
+/// among themselves without displacing the mining tip's dataset.
 pub fn get_context(prev: &[u8; 32], full_mem: bool) -> Arc<Context> {
     let key = blake3::hash(prev).into();
     let now = Instant::now();
@@ -60,15 +78,19 @@ pub fn get_context(prev: &[u8; 32], full_mem: bool) -> Arc<Context> {
     let ctx = Arc::new(Context::new(prev, full_mem));
 
     let mut cache = cache.lock().unwrap();
-    // Enforce the entry-count bound before inserting: evict the least
-    // recently used context so the cache never grows past the constant.
+    // Enforce the entry-count bound before inserting. The victim is the
+    // least recently used light context when one exists, falling back to
+    // plain least-recently-used order only when the cache holds
+    // exclusively full contexts.
     if cache.len() >= MAX_CONTEXT_CACHE_ENTRIES {
-        if let Some(oldest) = cache
+        let victim = cache
             .iter()
+            .filter(|(_, v)| !v.full_mem)
             .min_by_key(|(_, v)| v.last_used)
-            .map(|(k, _)| *k)
-        {
-            cache.remove(&oldest);
+            .or_else(|| cache.iter().min_by_key(|(_, v)| v.last_used))
+            .map(|(k, _)| *k);
+        if let Some(victim) = victim {
+            cache.remove(&victim);
         }
     }
     cache.insert(
@@ -76,23 +98,30 @@ pub fn get_context(prev: &[u8; 32], full_mem: bool) -> Arc<Context> {
         CachedContext {
             context: Arc::clone(&ctx),
             last_used: now,
+            full_mem,
         },
     );
     ctx
 }
 
-/// A candidate block assembled by the miner but not yet validated.
+/// A candidate block assembled by the miner but not yet validated. `time`
+/// carries the timestamp the search actually ground against: the block
+/// must be stamped with the same value or the proof is invalid for the
+/// header that commits to it.
 pub struct MinerBlock {
     pub nonce: u64,
     pub value: u64,
+    pub time: u64,
 }
 
 /// Search for a valid nonce in parallel across all available cores.
-///
 /// Each worker strides nonces by the worker count so no two workers evaluate
-/// the same candidate. The search stops as soon as any worker satisfies the
-/// difficulty target, finds a treasury-owned proof-of-work slot, or observes
-/// the cooperative cancellation flag.
+/// the same candidate, and every call draws a fresh random nonce base so two
+/// searches that start within the same wall-clock second — the common case
+/// for a retry after a stale-time rejection — cover disjoint subspaces with
+/// overwhelming probability instead of rescanning the identical sequence.
+/// The search stops as soon as any worker satisfies the difficulty target,
+/// finds an acceptable proof-of-work slot, or observes the cancellation flag.
 pub fn mine_parallel(
     prev: [u8; 32],
     time: u64,
@@ -107,6 +136,9 @@ pub fn mine_parallel(
     let ctx = get_context(&prev, true);
     let found = Arc::new(AtomicBool::new(false));
     let (tx, rx) = std::sync::mpsc::channel::<MinerBlock>();
+    // Random base for this search call: overlapping invocations within one
+    // second no longer share a nonce sequence.
+    let base = rand::random::<u64>();
     for i in 0..threads {
         let tx = tx.clone();
         let cancel = cancel.clone();
@@ -115,14 +147,21 @@ pub fn mine_parallel(
         let slot_check = Arc::clone(&slot_check);
         std::thread::spawn(move || {
             let hasher = RandomXHasher::new(ctx);
-            let mut nonce = i as u64;
+            let mut nonce = base.wrapping_add(i as u64);
+            // Each worker owns its timestamp copy; a winning worker
+            // publishes the value it ground against so the caller stamps
+            // the block with the matching time.
+            let mut time = time;
+            let mut iterations: u64 = 0;
             while !cancel.load(Ordering::Relaxed) && !found.load(Ordering::Relaxed) {
-                let mut inp = Vec::with_capacity(88);
-                inp.extend_from_slice(&prev);
-                inp.extend_from_slice(&time.to_le_bytes());
-                inp.extend_from_slice(&height.to_le_bytes());
-                inp.extend_from_slice(&nonce.to_le_bytes());
-                inp.extend_from_slice(&miner);
+                iterations = iterations.wrapping_add(1);
+                if iterations.is_multiple_of(TIME_REFRESH_INTERVAL) {
+                    let now = chrono::Utc::now().timestamp() as u64;
+                    if now > time {
+                        time = now;
+                    }
+                }
+                let inp = crate::chain::pow_input(prev, time, height, miner, nonce);
                 let out = hasher.hash(&inp);
                 let h = out.as_ref();
                 let u = u64::from_le_bytes(h[..8].try_into().unwrap());
@@ -132,7 +171,11 @@ pub fn mine_parallel(
                     // and exit. The receiver may already have returned, in
                     // which case the send result is ignored.
                     found.store(true, Ordering::Relaxed);
-                    let _ = tx.send(MinerBlock { nonce, value: u });
+                    let _ = tx.send(MinerBlock {
+                        nonce,
+                        value: u,
+                        time,
+                    });
                     break;
                 }
                 nonce = nonce.wrapping_add(threads as u64);
@@ -145,7 +188,9 @@ pub fn mine_parallel(
 
 /// Synchronous single-threaded mining used by tests and the miner RPC path.
 /// `slot_check` lets the caller reject proof-of-work slots that target
-/// non-treasury cells without invalidating the whole search.
+/// non-treasury cells without invalidating the whole search. The search
+/// starts from a random nonce and refreshes the timestamp from the wall
+/// clock; the returned block carries the time the proof was ground against.
 pub fn mine(
     prev: [u8; 32],
     time: u64,
@@ -157,20 +202,28 @@ pub fn mine(
 ) -> Option<MinerBlock> {
     let ctx = get_context(&prev, true);
     let hasher = RandomXHasher::new(ctx);
-    let mut nonce = 0u64;
+    let mut nonce = rand::random::<u64>();
+    let mut time = time;
+    let mut iterations: u64 = 0;
     while !cancel.load(Ordering::Relaxed) {
-        let mut inp = Vec::with_capacity(88);
-        inp.extend_from_slice(&prev);
-        inp.extend_from_slice(&time.to_le_bytes());
-        inp.extend_from_slice(&height.to_le_bytes());
-        inp.extend_from_slice(&nonce.to_le_bytes());
-        inp.extend_from_slice(&miner);
+        iterations = iterations.wrapping_add(1);
+        if iterations.is_multiple_of(TIME_REFRESH_INTERVAL) {
+            let now = chrono::Utc::now().timestamp() as u64;
+            if now > time {
+                time = now;
+            }
+        }
+        let inp = crate::chain::pow_input(prev, time, height, miner, nonce);
         let out = hasher.hash(&inp);
         let h = out.as_ref();
         let u = u64::from_le_bytes(h[..8].try_into().unwrap());
         let slot = u % crate::state::N;
         if u % diff == 0 && slot_check(slot) {
-            return Some(MinerBlock { nonce, value: u });
+            return Some(MinerBlock {
+                nonce,
+                value: u,
+                time,
+            });
         }
         nonce = nonce.wrapping_add(1);
     }
@@ -180,8 +233,10 @@ pub fn mine(
 /// Header-only nonce search used by the P2P mining loop. Unlike `mine` and
 /// `mine_parallel` it accepts any proof-of-work slot cell because the block
 /// template's slot is validated against the treasury ownership table later,
-/// during full block validation. Returns the winning nonce together with
-/// the slot cell derived from the hash output, or None on cancellation.
+/// during full block validation. Returns the winning nonce, the slot cell
+/// derived from the hash output, and the timestamp the search ground
+/// against — which may be later than the template time when a long search
+/// advanced it — or None on cancellation.
 pub fn mine_block(
     prev: [u8; 32],
     time: u64,
@@ -189,9 +244,9 @@ pub fn mine_block(
     miner: [u8; 32],
     diff: u64,
     cancel: Arc<AtomicBool>,
-) -> Option<(u64, u64)> {
+) -> Option<(u64, u64, u64)> {
     let found = mine(prev, time, height, miner, diff, cancel, |_| true)?;
-    Some((found.nonce, found.value % crate::state::N))
+    Some((found.nonce, found.value % crate::state::N, found.time))
 }
 
 /// Mining facade used by the P2P node. The node runs this blocking search on
@@ -203,9 +258,11 @@ impl Miner {
     /// Run the single-threaded nonce search and package the result into a
     /// block template. `cancel` and `slot_check` are optional conveniences:
     /// mining proceeds without cancellation, and without a slot predicate
-    /// every treasury-range solution is accepted. The block timestamp is the
-    /// wall clock at search start, matching the median-time and future-time
-    /// rules enforced during validation.
+    /// every treasury-range solution is accepted. The block timestamp is
+    /// the wall clock at search start; the search advances it while it
+    /// runs, and the returned block is stamped with the time the winning
+    /// proof was ground against, keeping the header and the proof
+    /// consistent under the median-time and future-time rules.
     pub fn mine(
         prev: [u8; 32],
         height: u64,
@@ -223,7 +280,7 @@ impl Miner {
         Some(crate::chain::Block {
             version: 1,
             prev,
-            time,
+            time: found.time,
             height,
             nonce: found.nonce,
             miner,

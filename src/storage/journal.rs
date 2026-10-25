@@ -15,7 +15,7 @@ pub fn journal_append_batch(blocks: &[crate::chain::Block]) -> anyhow::Result<()
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open("chain_journal.bin")?;
+        .open(crate::storage::data_path("chain_journal.bin"))?;
     for block in blocks {
         let record = bincode::serialize(block)?;
         // Length-prefixed records let the loader find record boundaries
@@ -36,7 +36,7 @@ pub fn journal_append_batch(blocks: &[crate::chain::Block]) -> anyhow::Result<()
 /// caller replays what is returned and treats the cut height as the
 /// recovery point.
 pub fn journal_load() -> Vec<crate::chain::Block> {
-    let Ok(bytes) = std::fs::read("chain_journal.bin") else {
+    let Ok(bytes) = std::fs::read(crate::storage::data_path("chain_journal.bin")) else {
         return Vec::new();
     };
     let mut out = Vec::new();
@@ -64,6 +64,6 @@ pub fn journal_load() -> Vec<crate::chain::Block> {
 pub fn journal_truncate() -> anyhow::Result<()> {
     // Truncating to a zero-length file keeps the inode stable for readers
     // that opened the path before the truncate.
-    std::fs::write("chain_journal.bin", [])?;
+    std::fs::write(crate::storage::data_path("chain_journal.bin"), [])?;
     Ok(())
 }

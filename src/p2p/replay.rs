@@ -9,7 +9,8 @@
 //! previous file intact and the reloaded cache is a consistent — possibly
 //! shorter — prefix of the live one. Persistence is dirty-flagged: the
 //! cache is written only after an identifier was actually recorded since
-//! the last persist, not on every housekeeping tick.
+//! the last persist, not on every housekeeping tick. The cache file lives
+//! inside the library data directory like every other on-chain file.
 
 use std::collections::{HashSet, VecDeque};
 
@@ -40,9 +41,11 @@ impl OnionReplayCache {
     /// Load the persisted cache from disk, or an empty cache when the file
     /// is absent or unreadable. A successfully loaded cache is clean: its
     /// contents already equal the on-disk image, so the next persist is
-    /// skipped until a new identifier arrives.
+    /// skipped until a new identifier arrives. The path is resolved
+    /// against the library data directory, so a node anchored with
+    /// `slash_init` reads the cache from its own base.
     pub fn load() -> Self {
-        let Ok(bytes) = std::fs::read("onion_seen.bin") else {
+        let Ok(bytes) = std::fs::read(crate::storage::data_path("onion_seen.bin")) else {
             return Self::new();
         };
         bincode::deserialize::<Vec<[u8; 32]>>(&bytes)

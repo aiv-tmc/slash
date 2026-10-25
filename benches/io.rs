@@ -30,9 +30,7 @@ pub fn bench_serialize_block(c: &mut Criterion) {
 
 /// Benchmark Merkle root computation for a page containing one hundred ranges.
 pub fn bench_page_merkle_root(c: &mut Criterion) {
-    let mut page = slash::state::Page {
-        ranges: BTreeMap::new(),
-    };
+    let mut page = slash::state::Page::default();
     for i in 0..100 {
         page.ranges.insert(
             i * 10,

@@ -1,10 +1,12 @@
 //! The authoritative on-chain DAO state and the proposal lifecycle:
-//! submission under the open-proposal cap, first-vote-wins voting,
-//! snapshot-pinned tallying, close, and execution.
+//! submission under the open-proposal cap with the quorum denominator
+//! captured at submission, first-vote-wins voting, snapshot-pinned
+//! tallying, close, execution, and bounded retention of terminal records.
 
 use super::payload::{execute_payload, payload_valid};
 use super::types::{
-    DaoOp, DaoPayload, Proposal, ProposalStatus, DAO_MAX_PROPOSALS, DAO_VOTING_PERIOD,
+    DaoOp, DaoPayload, MintProvenance, Proposal, ProposalStatus, DAO_MAX_PROPOSALS,
+    DAO_TERMINAL_RETENTION, DAO_VOTING_PERIOD,
 };
 use super::weight::{close_outcome, locked_weight, total_locked_weight};
 use serde::{Deserialize, Serialize};
@@ -13,19 +15,31 @@ use std::collections::BTreeMap;
 /// Authoritative on-chain DAO state, persisted as part of the state header.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct DaoState {
-    /// All proposals ever submitted, keyed by id. Pruned entries retain
-    /// their terminal status so historical ids are never reused.
+    /// Live and recently terminal proposals, keyed by id. Terminal
+    /// proposals survive for a bounded retention window so their outcome
+    /// stays observable and auditable on-chain, and are then removed, so
+    /// the table the per-block governance pass iterates stays bounded for
+    /// the node's whole life. Ids are never reused: the monotonically
+    /// increasing `next_id` only ever moves forward.
     pub proposals: BTreeMap<u64, Proposal>,
     /// Next proposal id to assign.
     pub next_id: u64,
+    /// Provenance of every cell a governance mint ever issued. The curve
+    /// vault funds sell payouts from buyers' payments alone; a mint moved
+    /// these cells out without a payment, so they carry no buy-back
+    /// rights, and the transfer engine refuses any sell of them back to
+    /// the treasury through this single set.
+    pub minted: MintProvenance,
 }
 
 impl DaoState {
-    /// Empty DAO state: no proposals and the first id reserved.
+    /// Empty DAO state: no proposals, the first id reserved, and no
+    /// governance-minted provenance recorded.
     pub fn genesis() -> Self {
         Self {
             proposals: BTreeMap::new(),
             next_id: 1,
+            minted: MintProvenance::default(),
         }
     }
 
@@ -37,9 +51,19 @@ impl DaoState {
             .count()
     }
 
-    /// Submit a proposal. Returns the assigned id, or None when the open
-    /// proposal cap is reached or the payload is structurally invalid.
-    pub fn submit(&mut self, payload: DaoPayload, height: u64) -> Option<u64> {
+    /// Submit a proposal, capturing the quorum denominator at the moment
+    /// the proposal opens. `locked_total` is the total locked weight at
+    /// the submission height, supplied by the caller; the value rides the
+    /// record so closing the proposal later never rescans the ledger.
+    /// Returns None when the open proposal cap is reached or the payload
+    /// is structurally invalid.
+    pub fn submit(
+        &mut self,
+        payload: DaoPayload,
+        submitter: [u8; 32],
+        height: u64,
+        locked_total: u64,
+    ) -> Option<u64> {
         if self.open_count() >= DAO_MAX_PROPOSALS {
             return None;
         }
@@ -51,12 +75,14 @@ impl DaoState {
         let proposal = Proposal {
             id,
             payload,
+            submitter,
             start_height: height,
             end_height: height.saturating_add(DAO_VOTING_PERIOD),
             snapshot_height: height,
+            locked_total,
             yes_weight: 0,
             no_weight: 0,
-            voters: BTreeSet::new(),
+            voters: std::collections::BTreeSet::new(),
             status: ProposalStatus::Voting,
             exec_height: 0,
         };
@@ -99,70 +125,40 @@ impl DaoState {
         true
     }
 
-    /// Advance every open proposal whose voting window has ended against a
-    /// single quorum denominator. Kept for callers that know the total
-    /// locked weight out of band; the consensus path prefers `tally_at`,
-    /// which pins the denominator to each proposal's own snapshot height.
-    pub fn tally(&mut self, total_locked_weight: u64, height: u64) {
+    /// Tally every proposal whose voting window has ended at `height`,
+    /// against the quorum denominator captured at submission, so the tally
+    /// is a pure function of the state as it stood when the proposal
+    /// opened and performs no ledger scans. Passed proposals sit in the
+    /// queue for the execution delay so voters can observe the outcome
+    /// before any state change.
+    pub fn tally_at(&mut self, height: u64) {
         for p in self.proposals.values_mut() {
             if p.status != ProposalStatus::Voting || height < p.end_height {
                 continue;
             }
-            let (status, exec_height) = close_outcome(p, total_locked_weight);
+            let (status, exec_height) = close_outcome(p, p.locked_total);
             p.status = status;
             p.exec_height = exec_height;
         }
     }
 
-    /// Advance every open proposal whose voting window has ended, using the
-    /// locked supply at each proposal's snapshot height as its quorum
-    /// denominator. Snapshot-pinned denominators make the outcome a pure
-    /// function of the snapshot state, so a long-running proposal cannot be
-    /// swayed by lock movements that happened after voting opened.
-    pub fn tally_at(&mut self, state: &crate::state::State, height: u64) {
-        let snapshotted: Vec<(u64, u64)> = self
-            .proposals
-            .values()
-            .filter(|p| p.status == ProposalStatus::Voting && height >= p.end_height)
-            .map(|p| (p.id, p.snapshot_height))
-            .collect();
-        for (id, snapshot_height) in snapshotted {
-            let total = total_locked_weight(state, snapshot_height);
-            let p = self.proposals.get_mut(&id).expect("id collected above");
-            let (status, exec_height) = close_outcome(p, total);
-            p.status = status;
-            p.exec_height = exec_height;
-        }
-    }
-
-    /// Close every proposal whose voting window has ended at `height` and
-    /// schedule the passed ones for execution after the public delay. The
-    /// quorum denominator is the locked supply at the proposal snapshot
-    /// height, so the outcome is a pure function of the snapshot state
-    /// and cannot be influenced by weight movements inside the voting
-    /// window. Passed proposals sit in the queue for the execution delay
-    /// so voters can observe the outcome before any state change.
-    pub fn close_due(&mut self, state: &crate::state::State, height: u64) {
-        for proposal in self.proposals.values_mut() {
-            if !matches!(proposal.status, ProposalStatus::Voting) {
-                continue;
-            }
-            if height < proposal.end_height {
-                continue;
-            }
-            let total = total_locked_weight(state, proposal.snapshot_height);
-            let (status, exec_height) = close_outcome(proposal, total);
-            if matches!(status, ProposalStatus::Passed) {
-                proposal.exec_height = exec_height;
-            }
-            proposal.status = status;
-        }
+    /// The per-block governance tick the chain driver runs: tally whatever
+    /// has closed and retire terminal records past the retention window.
+    pub fn close_due(&mut self, height: u64) {
+        self.tally_at(height);
+        self.prune_terminal(height);
     }
 
     /// Execute every passed proposal that reached its executable height.
-    /// Execution is applied against the provided state so mint and payout
-    /// transitions flow through the same ownership engine as treasury
-    /// pairs; unexecutable payloads expire instead of blocking the queue.
+    /// Execution flows through the same state transition engine as every
+    /// other economic primitive; a governance mint additionally pins the
+    /// funded ranges into the provenance set so the minted cells can
+    /// never be sold back through the curve. Marks commit only after
+    /// post-execution ownership confirms the engine moved exactly the
+    /// reserved cells to the payload target, so the provenance set can
+    /// never diverge from the ledger. Unexecutable payloads expire
+    /// instead of blocking the queue. After the pass, terminal proposals
+    /// older than the retention window are pruned.
     pub fn execute_due(&mut self, state: &mut crate::state::State, height: u64) {
         let due: Vec<u64> = self
             .proposals
@@ -175,7 +171,41 @@ impl DaoState {
                 Some(p) => p.payload.clone(),
                 None => continue,
             };
-            let ok = execute_payload(state, &payload, height);
+            let ok = match &payload {
+                DaoPayload::TreasuryMint { amount, to } => {
+                    // Reserve the main funding range on the pre-execution
+                    // state: canonical selection is deterministic, so the
+                    // reservation equals the range the mint consumes.
+                    let main = state.select_single(crate::state::TREASURY, *amount);
+                    let ok = execute_payload(state, &payload, height);
+                    if ok {
+                        // Pin the main range only when ownership confirms
+                        // the mint moved exactly those cells to the target.
+                        if let Some((s, e)) = main {
+                            if !state.owns(crate::state::TREASURY, s, e, height)
+                                && state.owns(*to, s, e, height)
+                            {
+                                self.minted.mark(s, e);
+                            }
+                        }
+                        // The dev-share mint selects on the post-main
+                        // state; reserve and verify it the same way.
+                        let dev = amount.saturating_mul(state.dev_fee_bps) / 10_000;
+                        if dev > 0 {
+                            if let Some((ds, de)) = state.select_single(crate::state::TREASURY, dev)
+                            {
+                                if !state.owns(crate::state::TREASURY, ds, de, height)
+                                    && state.owns(crate::state::DEV_FUND, ds, de, height)
+                                {
+                                    self.minted.mark(ds, de);
+                                }
+                            }
+                        }
+                    }
+                    ok
+                }
+                _ => execute_payload(state, &payload, height),
+            };
             let p = self.proposals.get_mut(&id).expect("id collected above");
             p.status = if ok {
                 ProposalStatus::Executed
@@ -183,15 +213,40 @@ impl DaoState {
                 ProposalStatus::Expired
             };
         }
+        self.prune_terminal(height);
+    }
+
+    /// Drop terminal proposals whose retention window has passed. The
+    /// window keeps every finished proposal observable on-chain long
+    /// enough to audit its outcome and then releases the record, so the
+    /// proposal set stays bounded for the node's whole life. Pruning is a
+    /// pure function of the proposals and the height, so every node drops
+    /// the same ids at the same height; votes for a pruned id find no
+    /// proposal and are dropped silently, like votes for an unknown id.
+    fn prune_terminal(&mut self, height: u64) {
+        let dead: Vec<u64> = self
+            .proposals
+            .values()
+            .filter(|p| {
+                p.status != ProposalStatus::Voting
+                    && p.status != ProposalStatus::Passed
+                    && height > p.end_height.saturating_add(DAO_TERMINAL_RETENTION)
+            })
+            .map(|p| p.id)
+            .collect();
+        for id in dead {
+            self.proposals.remove(&id);
+        }
     }
 
     /// Apply one governance operation carried by a transaction memo. The
     /// caller has already executed the transfer itself, so a rejected
-    /// operation never invalidates the transaction: the transfer stands and
-    /// the operation is silently dropped. Voting weight is evaluated at the
-    /// target proposal's snapshot height, so votes ride ordinary transfers
-    /// and pay the standard fee and dev-fund shares like any other
-    /// transaction.
+    /// operation never invalidates the transaction: the transfer stands
+    /// and the operation is silently dropped. Voting weight is evaluated
+    /// at the target proposal's snapshot height. A submission evaluates
+    /// the quorum denominator against the state the carrying block has
+    /// built so far, which is exactly the state every other node sees at
+    /// the same position in the same block.
     pub fn apply_op(
         &mut self,
         state: &crate::state::State,
@@ -200,7 +255,11 @@ impl DaoState {
         height: u64,
     ) -> bool {
         match op {
-            DaoOp::SubmitProposal { payload } => self.submit(payload.clone(), height).is_some(),
+            DaoOp::SubmitProposal { payload } => {
+                let locked_total = total_locked_weight(state, height);
+                self.submit(payload.clone(), voter, height, locked_total)
+                    .is_some()
+            }
             DaoOp::Vote {
                 proposal_id,
                 approve,
@@ -216,5 +275,3 @@ impl DaoState {
         }
     }
 }
-
-use std::collections::BTreeSet;

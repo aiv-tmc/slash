@@ -5,9 +5,12 @@
 //! peers, onion-seen persistence, and mempool eviction. Maintenance
 //! deliberately precedes the peer-emptiness early return so a
 //! disconnected node still persists its chain and relays submissions
-//! that arrived through RPC.
+//! that arrived through RPC. The eviction pass is a safety net: both
+//! insertion paths already enforce the cap before pushing, and the tick
+//! pass reconciles whatever hysteresis remains.
 
 use super::limits::{MEMPOOL_CAP, PEER_EXCHANGE_BATCH, SYNC_FULL_POLL_EVERY, SYNC_SAMPLE_SIZE};
+use super::mempool::evict_to_cap;
 use super::node::Node;
 use super::wire::Req;
 use libp2p::PeerId;
@@ -58,36 +61,14 @@ impl Node {
         self.evict_mempool();
     }
 
-    /// Evict the lowest-value transactions when the mempool exceeds its
-    /// cap: the transactions with the smallest fee-to-output ratio leave
-    /// first, and treasury payloads clean their pairing-table entries so
-    /// their funding payments become pairable again.
+    /// Safety-net pass over the mempool: the insertion paths already
+    /// enforce the cap before every push, so this reconciles whatever
+    /// residual state remains after block processing and reorg replays.
+    /// The eviction policy itself — lowest fee-to-output ratio first,
+    /// with treasury payloads cleaning their pairing entries — lives in
+    /// `mempool::evict_to_cap`, the single implementation every path
+    /// shares.
     fn evict_mempool(&mut self) {
-        while self.mempool.len() > MEMPOOL_CAP {
-            // Find the lowest fee-per-output transaction.
-            let worst = self
-                .mempool
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, tx)| {
-                    let out: u64 = tx.outputs.iter().map(|o| o.end - o.start).sum();
-                    let fee: u64 = tx
-                        .outputs
-                        .iter()
-                        .filter(|o| o.to == crate::state::FEE_VAULT)
-                        .map(|o| o.end - o.start)
-                        .sum();
-                    fee.saturating_mul(1_000_000).saturating_div(out.max(1))
-                })
-                .map(|(i, _)| i);
-            if let Some(i) = worst {
-                let tx = self.mempool.remove(i);
-                if tx.from == crate::state::TREASURY {
-                    super::mempool::evict_treasury_payload(&tx, &mut self.pairs);
-                }
-            } else {
-                break;
-            }
-        }
+        evict_to_cap(&mut self.mempool, &mut self.pairs, MEMPOOL_CAP);
     }
 }

@@ -4,7 +4,8 @@
 //! persists its chain and relays submissions that arrived through RPC.
 //! Everything here touches crate-internal node state.
 
-use super::mempool::admit_treasury_payload;
+use super::limits::MEMPOOL_CAP;
+use super::mempool::{admit_treasury_payload, evict_to_cap, tx_id};
 use super::node::Node;
 use libp2p::gossipsub::IdentTopic;
 
@@ -32,7 +33,10 @@ impl Node {
     /// starts at the tip's total_sold and advances in arrival order,
     /// exactly as the gossip admission path computes it. Ordinary
     /// transactions are validated against the tip and deduplicated by
-    /// signature against the mempool.
+    /// content-based transaction id against the mempool: the id binds the
+    /// signature and the whole body, so two distinct transactions never
+    /// collide on it and the same transaction never enters the pool
+    /// twice through different submission channels.
     fn drain_pending(&mut self) {
         let mut running_total = self.chain.state.total_sold;
         for tx in crate::drain_pending_txs() {
@@ -45,11 +49,22 @@ impl Node {
                     &mut running_total,
                 )
             } else {
-                self.chain.validate_tx(&tx) && !self.mempool.iter().any(|t| t.sig == tx.sig)
+                self.chain.validate_tx(&tx) && !self.mempool.iter().any(|t| tx_id(t) == tx_id(&tx))
             };
             if !admitted {
                 continue;
             }
+            // Enforce the cap before the insert: the RPC buffer can hold
+            // far more transactions than the mempool, and draining it on
+            // one tick must not push the pool past the bound between
+            // housekeeping passes. Evicting room for each entry first
+            // keeps the post-push size at or below the cap throughout
+            // the drain.
+            evict_to_cap(
+                &mut self.mempool,
+                &mut self.pairs,
+                MEMPOOL_CAP.saturating_sub(1),
+            );
             let bytes = bincode::serialize(&tx).unwrap_or_default();
             let _ = self
                 .swarm

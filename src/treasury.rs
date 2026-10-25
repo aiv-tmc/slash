@@ -34,9 +34,9 @@ pub fn sell_price(amount: u64, total_sold: u64) -> u64 {
 
 /// Treasury key material and non-consensus bookkeeping.
 ///
-/// The on-disk treasury record stores the three separated public keys
-/// (verifiable randomness, transaction signer, onion endpoint). The pricing
-/// counters that consensus actually evaluates live in State (total_sold and
+/// The on-disk treasury record stores the separated public keys for
+/// administrative signing and the onion endpoint. The pricing counters that
+/// consensus actually evaluates live in State (total_sold and
 /// total_bought_back) and are persisted with the state header; the copies
 /// kept on this struct are legacy bookkeeping for external tooling and are
 /// never consulted by block validation.
@@ -55,8 +55,6 @@ pub struct TreasuryState {
     /// reads State::total_bought_back instead.
     #[serde(default)]
     pub total_bought_back: u64,
-    /// Public VRF key used for verifiable randomness in cell selection.
-    pub vrf_public: [u8; 32],
     /// Public Ed25519 key used for administrative treasury transactions.
     pub signer_public: [u8; 32],
     /// Public X25519 key used for treasury onion routing.

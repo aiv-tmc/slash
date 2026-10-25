@@ -61,6 +61,26 @@ pub struct State {
     pub mine_fee_bps: u64,
     /// On-chain governance bookkeeping: proposals, votes, and schedules.
     pub dao: crate::dao::DaoState,
+    /// Emergency pause state, set only through passed EmergencyPause and
+    /// EmergencyResume proposals. While a flag bit is set and the height
+    /// is below `emergency_until`, the flagged operation classes are
+    /// refused in every block; the chain itself never stops — coinbase,
+    /// slot, and fee claims keep executing. The fields ride the ordinary
+    /// state transition, so a reorg that re-executes the carrying
+    /// proposal re-establishes the pause on the surviving branch.
+    pub emergency_flags: u8,
+    pub emergency_until: u64,
+    /// Pages dirtied since the last persisted save. Every mutation goes
+    /// through `get_page_mut`, which records the page here; the storage
+    /// layer drains the set to append exactly those pages to the
+    /// append-only page log, so a save rewrites O(touched) instead of
+    /// O(dirty). The mutex keeps the shared-reference save path usable
+    /// from `&State`; the set is excluded from serialization because it
+    /// is runtime bookkeeping, not ledger state. Draining clears the set,
+    /// so a poisoned lock panics loudly instead of silently missing a
+    /// write.
+    #[serde(skip)]
+    pub touched_pages: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<u16>>>,
 }
 
 impl State {
@@ -85,6 +105,11 @@ impl State {
             dev_fee_bps: 0,
             mine_fee_bps: 100,
             dao: crate::dao::DaoState::genesis(),
+            emergency_flags: 0,
+            emergency_until: 0,
+            touched_pages: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
         }
     }
 
@@ -162,6 +187,7 @@ impl State {
         } else {
             let mut p = Page {
                 ranges: BTreeMap::new(),
+                ..Default::default()
             };
             p.ranges.insert(
                 0,
@@ -176,11 +202,18 @@ impl State {
 
     /// Materialize and insert a page into the dirty map, returning a
     /// mutable reference. Every mutation path goes through here so a
-    /// dirty page always exists before any range surgery.
+    /// dirty page always exists before any range surgery, and the same
+    /// chokepoint records the page for the next persisted save: the
+    /// append-only page log rewrites exactly the recorded set.
     pub fn get_page_mut(&mut self, id: u16) -> &mut Page {
+        self.touched_pages
+            .lock()
+            .expect("touched-pages lock poisoned")
+            .insert(id);
         self.pages.entry(id).or_insert_with(|| {
             let mut p = Page {
                 ranges: BTreeMap::new(),
+                ..Default::default()
             };
             p.ranges.insert(
                 0,
@@ -214,6 +247,15 @@ impl State {
     /// map exactly.
     pub fn balance(&self, who: [u8; 32]) -> u64 {
         self.balance_cache.get(&who).copied().unwrap_or(0)
+    }
+
+    /// Whether an emergency pause flag is live at `height`: the flag bit
+    /// must be set in `emergency_flags` and the height must still be
+    /// below `emergency_until`. Every block-validation path asks this
+    /// question against the pre-block state, so a pause carried by one
+    /// block takes effect from the next and never mid-block.
+    pub fn emergency_active(&self, flag: u8, height: u64) -> bool {
+        self.emergency_flags & flag != 0 && height < self.emergency_until
     }
 
     /// The global root: blake3 over every page id paired with its root,

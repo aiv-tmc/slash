@@ -1,6 +1,6 @@
 # Slash Protocol
 
-[![CI](https://github.com/slash-protocol/slash/actions/workflows/ci.yml/badge.svg)](https://github.com/aiv-tmc/Slash/actions/workflows/ci.yml)
+[![CI](https://github.com/slash-protocol/slash/actions/workflows/ci.yml/badge.svg)](https://github.com/slash-protocol/slash/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.87%2B-orange.svg)](https://www.rust-lang.org)
 
@@ -49,7 +49,7 @@ Consensus is secured by **RandomX proof-of-work**, ensuring CPU-friendly and ASI
 ### Economic Layer
 - **Mandatory Fees**: every transaction pays at least 0.5 % of the transferred amount into the `FEE_VAULT`; miners claim accumulated fees in their blocks.
 - **Bonding Curve Treasury**: linear price growth denominated in cells; buys are paid into `TREASURY_VAULT` and minted atomically in the same block; sells are paid back at 98 % of the curve price, keeping the 2 % spread in the vault.
-- **Treasury Signer**: mint and payout transactions are signed with a dedicated Ed25519 key (key separation: VRF / signer / onion).
+- **Treasury Signer**: mint and payout transactions are signed with a dedicated Ed25519 key (key separation: signer / onion).
 
 ## Build Requirements
 
@@ -127,7 +127,6 @@ slash/
 │   ├── governance.rs    # Soft-fork rule registry and active rule validation
 │   ├── storage.rs       # Atomic file writes, snapshots, pruned recovery
 │   ├── treasury.rs      # Cell-denominated bonding curve math and treasury state
-│   ├── vrf.rs           # ECVRF-RISTRETTO255-SHA512 prove/verify
 │   ├── onion.rs         # 3-hop onion envelope construction and peeling
 │   ├── ffi.rs           # C-API for external wallet integration
 │   └── simulation.rs    # Economic stress tests (emission, hashrate drop, fee spike)
@@ -135,7 +134,7 @@ slash/
 │   └── benchmarks.rs    # Criterion benchmarks for tx, PoV, serialization
 ├── tests/
 │   ├── chain_tests.rs   # End-to-end chain, consensus, coinbase, emission tests
-│   ├── crypto_tests.rs  # Signature, encryption, VRF roundtrip tests
+│   ├── crypto_tests.rs  # Signature, encryption, and wallet tests
 │   ├── p2p_tests.rs     # Wire format, mempool policy, DoS resistance tests
 │   ├── storage_tests.rs # Atomic storage, snapshot, recovery tests
 │   ├── treasury_tests.rs# Bonding curve and treasury pairing tests
@@ -173,10 +172,12 @@ curl -X POST http://localhost:9944 \
 
 A C-compatible API is provided for hardware wallet and mobile integration:
 
-- `slash_generate_keypair()` → hex-encoded public key
+- `slash_init(datadir)` → anchors all library file access to the directory without changing the process working directory; call exactly once, before any other call
+- `slash_generate_encrypted_keypair(password)` → hex public key plus an encrypted wallet blob (JSON: `{"public","wallet"}`)
+- `slash_decrypt_secret(wallet_hex, password)` → hex-encoded secret for signing (caller frees and overwrites)
 - `slash_get_balance(hex_public)` → balance as `uint64_t`
-- `slash_sign_transaction(hex_secret, hex_payload)` → hex-encoded signature
-- `slash_verify_page_proof(hex_root, hex_leaf, leaf_index, siblings_json)` → `int`
+- `slash_sign_transaction(hex_secret, hex_payload)` → hex-encoded signature; the payload must already be the protocol's per-transaction sighash
+- `slash_verify_page_proof(hex_root, hex_leaf, leaf_index, siblings_json)` → `int`; sibling arrays are capped at 64 entries
 - `slash_free_string(char*)`
 
 ## Network Identifiers
@@ -222,4 +223,3 @@ This project is licensed under the MIT License. See [LICENSE](LICENSE) for detai
 - RandomX by the Monero project.
 - libp2p by Protocol Labs.
 - Ed25519/X25519 implementations by the dalek-cryptography project.
-

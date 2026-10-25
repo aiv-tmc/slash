@@ -4,7 +4,9 @@
 //! is shorter than one relay address — a malformed envelope must never be
 //! able to crash the peeling node.
 
-use super::{unpad_payload, OnionTx, PeelResult};
+use super::{
+    unpad_payload, OnionTx, PeelResult, INNER_KEY_DOMAIN, LAYER_KEY_DOMAIN, MARKER_KEY_DOMAIN,
+};
 use zeroize::Zeroizing;
 
 /// Remove the outermost onion layer using the relay's X25519 secret.
@@ -15,9 +17,23 @@ pub fn peel(onion: &OnionTx, secret: &[u8; 32]) -> Option<PeelResult> {
     }
     let layer = &onion.layers[0];
     let sec = x25519_dalek::StaticSecret::from(*secret);
+    // A low-order layer ephemeral yields the all-zero shared secret, which
+    // is rejected so that a crafted envelope cannot route attacker-chosen
+    // payloads through honest relays under the publicly known degenerate key.
+    let shared = crate::crypto::x25519_shared(&sec, &layer.ephemeral)?;
+    // The innermost layer always carries the exit marker and is encrypted
+    // under the marker domain; every layer in front of it carries routing
+    // data and is encrypted under the routing domain. The domain split
+    // mirrors the construction side, which binds each plaintext domain to
+    // its own key derived from the same shared secret.
+    let domain = if onion.layers.len() == 1 {
+        MARKER_KEY_DOMAIN
+    } else {
+        LAYER_KEY_DOMAIN
+    };
     // The derived layer key is wrapped in Zeroizing so it is overwritten as
     // soon as the decrypt call returns, regardless of which branch exits.
-    let key = Zeroizing::new(crate::crypto::x25519_shared(&sec, &layer.ephemeral));
+    let key = Zeroizing::new(crate::crypto::kdf_domain(&shared, domain));
     let padded = crate::crypto::aes_decrypt(&key, &layer.nonce, &layer.ciphertext)?;
     let plaintext = unpad_payload(&padded)?;
     // The next-hop address occupies the first 32 bytes of the decrypted
@@ -36,7 +52,6 @@ pub fn peel(onion: &OnionTx, secret: &[u8; 32]) -> Option<PeelResult> {
         inner: onion.inner.clone(),
         inner_nonce: onion.inner_nonce,
         final_ephemeral: onion.final_ephemeral,
-        onion_id: onion.onion_id,
     };
     Some(PeelResult {
         next_relay,
@@ -54,7 +69,10 @@ pub fn decrypt_inner(onion: &OnionTx, secret: &[u8; 32]) -> Option<crate::chain:
         return None;
     }
     let sec = x25519_dalek::StaticSecret::from(*secret);
-    let key = Zeroizing::new(crate::crypto::x25519_shared(&sec, &onion.final_ephemeral));
+    // The same low-order rejection as the layer path guards the exit
+    // decryption against crafted final ephemerals.
+    let shared = crate::crypto::x25519_shared(&sec, &onion.final_ephemeral)?;
+    let key = Zeroizing::new(crate::crypto::kdf_domain(&shared, INNER_KEY_DOMAIN));
     let padded = crate::crypto::aes_decrypt(&key, &onion.inner_nonce, &onion.inner)?;
     let plaintext = unpad_payload(&padded)?;
     bincode::deserialize(&plaintext).ok()

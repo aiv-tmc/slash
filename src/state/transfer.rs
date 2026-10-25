@@ -4,17 +4,19 @@
 // mempool, fixtures, FFI — without removing a real hazard.
 #![allow(clippy::too_many_arguments)]
 
-//! The transfer pipeline: the single entry point `tx` plus the internal
-//! apply stage it drives.
+//! The transfer pipeline: one shared core of predicates and staging that
+//! the committing engine (`tx`, and the consensus-internal `apply_transfer`)
+//! and the read-only admission twin (`tx_speculative`, in the `speculative`
+//! child module) both drive. A transfer is staged on a touched-page
+//! overlay and applied to the live map only when every check — packing,
+//! per-page balance, ownership with locks, the treasury-lock rule, the
+//! governance-mint provenance rule, and the global lock cap — passed, so
+//! a rejected transaction leaves no partial mutation behind. Because the
+//! predicates and the staging live in exactly one place, the admission
+//! verdict is bit-identical to the engine verdict by construction.
 //!
-//! A transfer is staged on a scratch page map and applied to the live map
-//! only when every check — packing, per-page balance, ownership with locks,
-//! signatures, minimums, fees, the dev-fund share, the treasury-lock rule,
-//! and the global lock cap — passed, so a rejected transaction leaves no
-//! partial mutation behind. Lock registrations stage alongside the pages
-//! and commit under the same gate: a locked output binds every cell of its
-//! range, records its creation height for governance snapshot weight, and
-//! a rejected transfer must not leave any lock entry behind in either map.
+//! The predicate core lives in the `gates` child module; this file keeps
+//! the entry points, the staging overlay, and the commit.
 
 use super::page::Output;
 use super::page::{Page, R};
@@ -25,11 +27,57 @@ use super::params::{
 use super::state::State;
 use std::collections::{BTreeMap, HashMap};
 
+/// The admission twin of the transfer engine. It runs the identical
+/// gates and staging against `&self` and commits nothing, so mempool
+/// admission costs work proportional to the transaction's footprint
+/// instead of a clone of the whole ledger.
+#[path = "transfer_speculative.rs"]
+mod speculative;
+
+/// The shared predicate core of the transfer engine. Both the committing
+/// entry points here and the admission twin enter through it, so no gate
+/// can drift between mempool admission and block execution.
+#[path = "transfer_gates.rs"]
+mod gates;
+
+/// Materialize a pristine page: a single treasury range spanning the whole
+/// page. The overlay constructs it whenever a transaction first touches a
+/// page the dirty map does not hold, so ownership edits never observe a
+/// missing page. The Merkle cache starts empty: the pristine page is
+/// fresh, and the first root computation builds the tree against these
+/// exact ranges.
+fn pristine_page(pid: u16) -> Page {
+    let mut p = Page {
+        ranges: BTreeMap::new(),
+        ..Default::default()
+    };
+    p.ranges.insert(
+        0,
+        R {
+            e: page_size(pid),
+            o: TREASURY,
+        },
+    );
+    p
+}
+
+/// The staged effect of a transfer that passed every check: the touched
+/// pages in overlay form, the balance-cache deltas, the lock
+/// registrations, and the executing height the lock-creation map reads.
+/// Committing is infallible: every predicate ran during staging.
+struct StagedTransfer {
+    height: u64,
+    overlay: BTreeMap<u16, Page>,
+    delta_cache: HashMap<[u8; 32], i128>,
+    staged_locks: Vec<(u64, u64, u64)>,
+}
+
 impl State {
-    /// Execute a transaction: structure, conservation, fee, ownership,
-    /// signature, and per-page balance, in that order. Rejection leaves
-    /// the state untouched: every mutation is staged on a scratch page map
-    /// and committed only when all checks pass.
+    /// Execute a signed transaction: every predicate, then commit.
+    /// Rejection leaves the state untouched. Under the `SLASH_TRACE_TX`
+    /// environment variable the refusal phase (gates or staging) is
+    /// logged with the sender and inputs, so a failing template or test
+    /// localizes the defect from a single run.
     pub fn tx(
         &mut self,
         from: [u8; 32],
@@ -41,108 +89,38 @@ impl State {
         scheme: u8,
         memo: &Option<Vec<u8>>,
     ) -> bool {
-        if inputs.is_empty() || outputs.is_empty() {
+        if !self.transfer_gates(&from, inputs, outputs, sig, chain_id, scheme, memo) {
+            if std::env::var_os("SLASH_TRACE_TX").is_some() {
+                eprintln!(
+                    "[txs] transfer refused at gates: from {} inputs {:?} scheme {}",
+                    hex::encode(from),
+                    inputs,
+                    scheme
+                );
+            }
             return false;
         }
-        // Inputs must be sorted and non-overlapping, so staged removal can
-        // walk them in order and every cell is charged exactly once.
-        let mut prev_end = 0u64;
-        for &(s, e) in inputs {
-            if e <= s || s < prev_end {
-                return false;
+        let Some(staged) = self.stage_transfer(from, inputs, outputs, height) else {
+            if std::env::var_os("SLASH_TRACE_TX").is_some() {
+                eprintln!(
+                    "[txs] transfer refused at staging: from {} inputs {:?} height {}",
+                    hex::encode(from),
+                    inputs,
+                    height
+                );
             }
-            prev_end = e;
-        }
-        // Outputs must pack the inputs exactly in declaration order.
-        let mut cursor = inputs[0].0;
-        for out in outputs {
-            if out.end <= out.start || out.start != cursor {
-                return false;
-            }
-            cursor = out.end;
-        }
-        if cursor != prev_end {
             return false;
-        }
-        let total_out: u64 = outputs.iter().map(|o| o.end - o.start).sum();
-        if total_out < MIN {
-            return false;
-        }
-        if scheme > 1 {
-            return false;
-        }
-        // A locked output back to the treasury is refused outright: no key
-        // controls the treasury address, so a lock on a treasury-owned
-        // cell could never be removed by spending it, and a live lock
-        // inside a canonical funding range would wedge every mint that
-        // selects that range. The refusal runs before any staging, so the
-        // lock maps are never touched.
-        if outputs.iter().any(|o| o.to == TREASURY && o.lock.is_some()) {
-            return false;
-        }
-        // The treasury sender is not a user key: a treasury transaction
-        // must be signed by the configured treasury signer, and a chain
-        // without a configured signer refuses every treasury transaction
-        // by construction. The check runs before any staging, so a
-        // rejection never touches the state.
-        if from == TREASURY {
-            if self.treasury_signer == [0u8; 32] {
-                return false;
-            }
-            let hash = crate::chain::Chain::tx_signature_hash(
-                &from, inputs, outputs, chain_id, scheme, memo,
-            );
-            if !crate::crypto::verify(&self.treasury_signer, &hash, sig) {
-                return false;
-            }
-        } else {
-            // Signature over the shared hash: sender, inputs, outputs,
-            // chain identifier, scheme, and memo. The digest function
-            // lives on the chain so mempool and block paths compute the
-            // identical hash.
-            let hash = crate::chain::Chain::tx_signature_hash(
-                &from, inputs, outputs, chain_id, scheme, memo,
-            );
-            let ok = crate::crypto::verify(&from, &hash, sig);
-            if !ok {
-                return false;
-            }
-        }
-        // Fee: outputs to the fee vault must total at least total_out /
-        // MIN_FEE_DENOMINATOR, recomputed from the transaction itself.
-        // Treasury sends — the coinbase and the curve pairing mints and
-        // payouts — are consensus-only constructions and never pay the
-        // user fee.
-        let fee_out: u64 = outputs
-            .iter()
-            .filter(|o| o.to == FEE_VAULT)
-            .map(|o| o.end - o.start)
-            .sum();
-        if from != TREASURY && fee_out.saturating_mul(MIN_FEE_DENOMINATOR) < total_out {
-            return false;
-        }
-        // Dev-fund share while configured. Zero disables the rule entirely.
-        // Dev-fund spends and treasury paths are exempt: the dev fund
-        // cannot pay itself, and treasury transfers are consensus
-        // constructions.
-        if self.dev_fee_bps > 0 && from != DEV_FUND && from != TREASURY {
-            let dev_out: u64 = outputs
-                .iter()
-                .filter(|o| o.to == DEV_FUND)
-                .map(|o| o.end - o.start)
-                .sum();
-            let required = (total_out.saturating_mul(self.dev_fee_bps) / 10_000).max(1);
-            if dev_out < required {
-                return false;
-            }
-        }
-        self.apply_transfer(from, inputs, outputs, height)
+        };
+        self.commit_transfer(staged);
+        true
     }
 
-    /// Stage a transfer on a scratch page map, then commit. Every check
-    /// runs before any mutation of the live map, so a rejection leaves the
-    /// state exactly as it was. Ownership failures short-circuit before
-    /// any page materialization work.
+    /// Stage and commit a transfer whose validity comes from consensus
+    /// rules rather than a transaction signature: the coinbase mint, the
+    /// curve pairing mints and payouts, and the proof-of-work slot claim
+    /// all reach the engine through this entry. The staged pipeline is
+    /// the same one signed transactions use, so ownership, per-page
+    /// balance, and the lock cap hold identically.
     pub(crate) fn apply_transfer(
         &mut self,
         from: [u8; 32],
@@ -150,49 +128,56 @@ impl State {
         outputs: &[Output],
         height: u64,
     ) -> bool {
-        // Locked outputs to the treasury are structurally impossible and
-        // refused here so that no caller of the transfer engine — user
-        // transactions, coinbase mints, DAO mints, vault payouts — can
-        // ever route a lock onto an address no key controls.
-        if outputs.iter().any(|o| o.to == TREASURY && o.lock.is_some()) {
+        let Some(staged) = self.stage_transfer(from, inputs, outputs, height) else {
             return false;
+        };
+        self.commit_transfer(staged);
+        true
+    }
+
+    /// Stage a transfer on a touched-page overlay. Pages the transaction
+    /// does not touch are never cloned: the overlay materializes a page
+    /// from the live map — or in its pristine treasury form when the live
+    /// map has no entry — on first touch and mutates the copy. Ownership
+    /// is verified against the live map, which staging never modifies.
+    /// Returns None on any refusal, leaving the live state untouched.
+    fn stage_transfer(
+        &self,
+        from: [u8; 32],
+        inputs: &[(u64, u64)],
+        outputs: &[Output],
+        height: u64,
+    ) -> Option<StagedTransfer> {
+        // Locked outputs to the treasury are structurally impossible and
+        // refused here so that no caller of the transfer engine can ever
+        // route a lock onto an address no key controls.
+        if outputs.iter().any(|o| o.to == TREASURY && o.lock.is_some()) {
+            return None;
         }
-        // Stage on a copy of the dirty map so a failed transfer never
-        // materializes pages or mutates ranges.
-        let mut staged = self.pages.clone();
+        let mut overlay: BTreeMap<u16, Page> = BTreeMap::new();
         let mut per_page: BTreeMap<u16, i128> = BTreeMap::new();
-        // Balance-cache deltas accumulate alongside the page staging and
+        // Balance-cache deltas accumulate alongside the overlay and
         // commit only when every check passed. The treasury debit starts
         // from the full unissued supply: the cache is filled lazily, so a
-        // treasury entry debited before any credit exists starts at N.
+        // debit before any credit exists starts at N.
         let mut delta_cache: HashMap<[u8; 32], i128> = HashMap::new();
-        // Lock registrations stage alongside the pages: a locked output
-        // binds every cell of its range until the recorded height, so a
-        // rejected transfer must not leave any lock entry behind in
-        // either map.
+        // Lock registrations stage alongside the pages and commit under
+        // the same gate.
         let mut staged_locks: Vec<(u64, u64, u64)> = Vec::new();
-        // Verify ownership and remove the inputs from the staged map. Each
-        // input span is checked with locks inside `owns`.
+        // Verify ownership and remove the inputs from the overlay.
         for &(s, e) in inputs {
             let pid = page_id(s);
             if !self.owns(from, s, e, height) {
-                return false;
+                return None;
             }
-            let page = staged.entry(pid).or_insert_with(|| {
-                let mut p = Page {
-                    ranges: BTreeMap::new(),
-                };
-                p.ranges.insert(
-                    0,
-                    R {
-                        e: page_size(pid),
-                        o: TREASURY,
-                    },
-                );
-                p
+            let page = overlay.entry(pid).or_insert_with(|| {
+                self.pages
+                    .get(&pid)
+                    .cloned()
+                    .unwrap_or_else(|| pristine_page(pid))
             });
             if !page.remove_range(page_offset(s), page_offset(s) + (e - s)) {
-                return false;
+                return None;
             }
             *per_page.entry(pid).or_insert(0) -= (e - s) as i128;
             *delta_cache.entry(from).or_insert(0) -= (e - s) as i128;
@@ -200,18 +185,11 @@ impl State {
         // Insert the outputs and accumulate the per-page balance delta.
         for out in outputs {
             let pid = page_id(out.start);
-            let page = staged.entry(pid).or_insert_with(|| {
-                let mut p = Page {
-                    ranges: BTreeMap::new(),
-                };
-                p.ranges.insert(
-                    0,
-                    R {
-                        e: page_size(pid),
-                        o: TREASURY,
-                    },
-                );
-                p
+            let page = overlay.entry(pid).or_insert_with(|| {
+                self.pages
+                    .get(&pid)
+                    .cloned()
+                    .unwrap_or_else(|| pristine_page(pid))
             });
             page.insert_output(
                 page_offset(out.start),
@@ -220,27 +198,24 @@ impl State {
             );
             *per_page.entry(pid).or_insert(0) += (out.end - out.start) as i128;
             *delta_cache.entry(out.to).or_insert(0) += (out.end - out.start) as i128;
-            // A locked output locks every cell of its range until the
-            // recorded height. The registration itself stages here and
-            // commits only when every check passed.
             if let Some(lock) = out.lock {
                 staged_locks.push((out.start, out.end, lock));
             }
         }
-        // Per-page balance: each affected page must net to exactly zero, so
-        // cells cannot be smuggled across page boundaries inside one
+        // Per-page balance: each affected page must net to exactly zero,
+        // so cells cannot be smuggled across page boundaries inside one
         // transaction.
         for delta in per_page.values() {
             if *delta != 0 {
-                return false;
+                return None;
             }
         }
         // Global lock cap: the live map plus this transaction's locked
         // cells must stay within MAX_LOCKED_CELLS. Only locks still live
         // at the executing height count — a lock binds spending while its
-        // expiry is strictly greater than the height, the same predicate
-        // the ownership scan uses — so expired entries, which are due for
-        // pruning, neither block spending nor consume capacity.
+        // expiry strictly exceeds the height, the predicate the ownership
+        // scan uses — so expired entries neither block spending nor
+        // consume capacity.
         let live_locks = self
             .locks
             .values()
@@ -248,23 +223,33 @@ impl State {
             .count() as u64;
         let new_locked: u64 = staged_locks.iter().map(|(s, e, _)| e - s).sum();
         if live_locks.saturating_add(new_locked) > MAX_LOCKED_CELLS {
-            return false;
+            return None;
         }
-        // Commit the staged lock registrations: every cell of every
-        // locked output range is registered individually in both global
-        // maps — the expiry it binds spending with, and the creation
-        // height governance snapshot weight reads — so ownership checks,
-        // unlocked-cell selection, and weight scans observe the full
-        // locked span.
-        for (s, e, lock) in staged_locks {
+        Some(StagedTransfer {
+            height,
+            overlay,
+            delta_cache,
+            staged_locks,
+        })
+    }
+
+    /// Commit a staged transfer. Every predicate ran during staging, so
+    /// this is infallible: lock registrations, the overlay merge with
+    /// pristine eviction, and the balance-cache deltas land under one
+    /// gate.
+    fn commit_transfer(&mut self, staged: StagedTransfer) {
+        // Every cell of every locked output range is registered
+        // individually in both global maps — the expiry it binds spending
+        // with, and the creation height governance snapshot weight reads.
+        for (s, e, lock) in staged.staged_locks {
             for cell in s..e {
                 self.locks.insert(cell, lock);
-                self.lock_created.insert(cell, height);
+                self.lock_created.insert(cell, staged.height);
             }
         }
-        // Apply the staged pages to the live map, dropping pristine pages
-        // that returned to the canonical single-range form.
-        for (pid, page) in staged {
+        // Apply the overlay to the live map, dropping pages that returned
+        // to the canonical single-range pristine form.
+        for (pid, page) in staged.overlay {
             if page.ranges.len() == 1 {
                 if let Some((&s, r)) = page.ranges.iter().next() {
                     if s == 0 && r.o == TREASURY && r.e == page_size(pid) {
@@ -275,22 +260,17 @@ impl State {
             }
             self.pages.insert(pid, page);
         }
-        // Commit the balance cache deltas only after every page check
-        // passed, so a rejected transfer leaves the cache untouched too.
-        // A treasury debit on an untouched ledger starts from the full
-        // unissued supply; every other address starts from zero.
-        for (owner, d) in delta_cache {
+        // Commit the balance cache deltas. A treasury debit starts from
+        // the full unissued supply; every other address starts from zero.
+        for (owner, d) in staged.delta_cache {
             let default = if owner == TREASURY { N } else { 0 };
             let entry = self.balance_cache.entry(owner).or_insert(default);
             *entry = (*entry as i128 + d) as u64;
         }
-        true
     }
 
     /// Remove an owned span from the live map for a spend, re-checking
-    /// ownership with locks first. The balance cache debits in lockstep;
-    /// a treasury debit on an untouched ledger starts from the full
-    /// unissued supply.
+    /// ownership with locks first. The balance cache debits in lockstep.
     pub(crate) fn remove_for_spend(
         &mut self,
         owner: [u8; 32],

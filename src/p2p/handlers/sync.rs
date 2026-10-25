@@ -1,6 +1,7 @@
 //! Request serving and response-driven sync: capped header/block ranges,
-//! onion-key registration with challenge attestation, and the
-//! tip-comparison pipeline that drives header-first synchronization.
+//! onion-key registration with challenge attestation, request-channel
+//! throttling, and the tip-comparison pipeline that drives header-first
+//! synchronization.
 
 use super::super::node::Node;
 use super::super::util::peer_id_ed25519_key;
@@ -9,9 +10,9 @@ use libp2p::request_response;
 use libp2p::PeerId;
 
 impl Node {
-    /// Request-response events: inbound requests are served, inbound
-    /// responses drive the sync pipeline and attestation verification, and
-    /// failures record strikes.
+    /// Request-response events: inbound requests are served under the
+    /// per-peer request bucket, inbound responses drive the sync pipeline
+    /// and attestation verification, and failures record strikes.
     pub(super) async fn handle_req_resp(
         &mut self,
         event: request_response::Event<Req, Resp>,
@@ -44,13 +45,46 @@ impl Node {
         Ok(())
     }
 
-    /// Serve one inbound request from local state. Header and block ranges
-    /// are capped per response (256 headers, 64 blocks) so a single request
-    /// cannot exhaust the frame budget. The onion-key requests register
-    /// this peer's key in the local routing table and answer from the
-    /// persisted onion secret; the V2 challenge binds the answer to this
-    /// peer's Ed25519 identity.
+    /// Serve one inbound request from local state, or refuse it under
+    /// the request bucket. The request channel is the most expensive
+    /// per-message surface of the node — a single GetBlocks serializes
+    /// up to 64 blocks — so every inbound request spends tokens priced
+    /// by serving cost. A refused request gets an empty Ack; a peer that
+    /// keeps pressing against the bucket past three consecutive refusals
+    /// records a strike, while one admitted request clears the count, so
+    /// honest sync is never punished and only sustained draining climbs
+    /// the ban ladder.
     async fn serve_request(&mut self, peer: PeerId, req: Req) -> Resp {
+        use super::super::limits::*;
+        let cost = match &req {
+            Req::GetBlock(..) => REQ_COST_BLOCK,
+            Req::GetBlocks(..) => REQ_COST_BLOCKS,
+            Req::GetTip => REQ_COST_TIP,
+            Req::GetHeaders(..) => REQ_COST_HEADERS,
+            Req::GetOnionKey | Req::GetOnionKeyV2(..) => REQ_COST_ONION_KEY,
+            Req::ForwardOnion(..) => REQ_COST_FORWARD_ONION,
+        };
+        // Every refused request is answered with an empty Ack; the peer
+        // learns nothing about the local state and pays nothing. A
+        // refusal past the consecutive threshold additionally records a
+        // strike, so the ban ladder engages only on sustained draining.
+        let refusal = {
+            let entry = self.buckets.entry(peer).or_default();
+            if entry.take_req(cost) {
+                entry.clear_req_refusal();
+                None
+            } else if entry.note_req_refusal() {
+                Some(true)
+            } else {
+                Some(false)
+            }
+        };
+        if let Some(past_threshold) = refusal {
+            if past_threshold {
+                self.record_strike(peer);
+            }
+            return Resp::Ack;
+        }
         match req {
             Req::GetBlock(height) => {
                 let idx = height.wrapping_sub(self.chain.base_height) as usize;
@@ -94,19 +128,23 @@ impl Node {
                 Resp::Headers(out)
             }
             Req::GetOnionKey => {
-                let key = self.onion_public();
-                self.onion_keys.insert(peer, key);
-                self.onion_key_to_peer.insert(key, peer);
-                Resp::OnionKey(key)
+                // The legacy unauthenticated answer is retained as a
+                // fallback for peers that predate the attestation scheme.
+                // The requester's identity proves nothing here, so the
+                // routing table is left untouched: only keys verified on
+                // the response side ever populate it.
+                Resp::OnionKey(self.onion_public())
             }
             Req::GetOnionKeyV2(nonce) => {
+                // The challenge nonce binds the signed answer to this
+                // exchange: the signature covers nonce||key, so a replayed
+                // attestation from an earlier session cannot be re-bound
+                // to a fresh nonce without the identity secret.
                 let key = self.onion_public();
                 let mut msg = nonce.to_vec();
                 msg.extend_from_slice(&key);
                 let digest = blake3::hash(&msg);
                 let sig = crate::crypto::sign(&self.node_secret(), digest.as_bytes());
-                self.onion_keys.insert(peer, key);
-                self.onion_key_to_peer.insert(key, peer);
                 Resp::OnionKeyV2(nonce, key, sig)
             }
             Req::ForwardOnion(bytes) => {
@@ -117,8 +155,11 @@ impl Node {
     }
 
     /// Handle a response to one of our requests: header sync, block sync,
-    /// and onion-key attestation verification. Only attested keys enter
-    /// the routing table, which closes the relay substitution hole.
+    /// and onion-key attestation verification. Only a response that
+    /// answers the exact challenge issued at connection time, carries a
+    /// valid identity signature, and advertises a sound curve point enters
+    /// the routing table, which closes the relay key-substitution and
+    /// attestation-replay holes.
     async fn handle_response(&mut self, peer: PeerId, response: Resp) {
         match response {
             Resp::Tip(height, _hash) => {
@@ -194,24 +235,54 @@ impl Node {
             Resp::Block(_) => {}
             Resp::OnionKey(key) => {
                 // Legacy unauthenticated key: usable only as a fallback
-                // when no attested key exists for the peer.
-                self.onion_keys.entry(peer).or_insert(key);
-                self.onion_key_to_peer.entry(key).or_insert(peer);
+                // when no attested key exists for the peer. A low-order
+                // key would make every envelope routed through it
+                // readable by anyone, so the probe is applied here too;
+                // an unusable key is skipped without touching reputation,
+                // because the legacy path carries no attestation at all.
+                let probe = x25519_dalek::StaticSecret::from(self.onion_secret());
+                if crate::crypto::x25519_shared(&probe, &key).is_some() {
+                    self.onion_keys.entry(peer).or_insert(key);
+                    self.onion_key_to_peer.entry(key).or_insert(peer);
+                }
             }
             Resp::OnionKeyV2(nonce, key, sig) => {
+                // The response must answer the exact challenge issued at
+                // connection time. Removing the entry also consumes it:
+                // each challenge is single-use, so a peer cannot answer
+                // one challenge twice or relay a captured attestation to
+                // a different session.
+                match self.onion_challenges.remove(&peer) {
+                    Some(expected) if expected == nonce => {}
+                    _ => return,
+                }
                 // Attested key: verify the Ed25519 signature over the
                 // challenge nonce and key against the peer's identity key.
-                // Only a verified attestation enters the routing table,
-                // which closes the relay key-substitution hole.
                 let mut msg = nonce.to_vec();
                 msg.extend_from_slice(&key);
                 let digest = blake3::hash(&msg);
                 let ok = peer_id_ed25519_key(&peer)
                     .is_some_and(|pk| crate::crypto::verify(&pk, digest.as_bytes(), &sig));
-                if ok {
-                    self.onion_keys.insert(peer, key);
-                    self.onion_key_to_peer.insert(key, peer);
+                if !ok {
+                    return;
                 }
+                // A valid signature proves possession of the identity
+                // secret, but a low-order X25519 key is still soundless:
+                // every Diffie-Hellman output computed against it is the
+                // all-zero string, so any envelope built through this
+                // relay would be decryptable by anyone. The key is
+                // probed with a Diffie-Hellman exchange against this
+                // node's own onion secret before it enters the table, and
+                // a peer advertising such a key is struck: the
+                // advertisement is semantically invalid, not merely
+                // unlucky.
+                let probe = x25519_dalek::StaticSecret::from(self.onion_secret());
+                if crate::crypto::x25519_shared(&probe, &key).is_none() {
+                    self.record_strike(peer);
+                    return;
+                }
+                self.onion_keys.insert(peer, key);
+                self.onion_key_to_peer.insert(key, peer);
             }
             // Acknowledgement to our own forwarded onion: nothing to do.
             Resp::Ack => {}

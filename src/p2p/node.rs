@@ -54,6 +54,13 @@ pub struct Node {
     pub(crate) rejected_inbound: HashSet<Multiaddr>,
     pub(crate) onion_keys: HashMap<PeerId, [u8; 32]>,
     pub(crate) onion_key_to_peer: HashMap<[u8; 32], PeerId>,
+    /// Outstanding onion-key attestation challenges: the random nonce sent
+    /// to a peer in a GetOnionKeyV2 request. The response is accepted only
+    /// when it carries this exact nonce, which binds the attestation to
+    /// the current session and makes a captured response from an earlier
+    /// session worthless. Entries are removed when the response arrives
+    /// or the connection closes.
+    pub(crate) onion_challenges: HashMap<PeerId, [u8; 32]>,
     pub(crate) seen_onions: super::replay::OnionReplayCache,
     pub(crate) known_addrs: Vec<Multiaddr>,
     pub(crate) cmd_rx: mpsc::Receiver<NodeCommand>,
@@ -178,6 +185,7 @@ impl Node {
             rejected_inbound: HashSet::new(),
             onion_keys: HashMap::new(),
             onion_key_to_peer: HashMap::new(),
+            onion_challenges: HashMap::new(),
             seen_onions: super::replay::OnionReplayCache::load(),
             known_addrs: Vec::new(),
             cmd_rx,

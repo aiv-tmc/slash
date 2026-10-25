@@ -15,8 +15,9 @@ use super::super::wire::Req;
 use libp2p::gossipsub::IdentTopic;
 use libp2p::PeerId;
 
-use crate::chain::{subsidy_at, Block, BlockError, Tx};
-use crate::p2p::mempool::tx_id;
+use crate::chain::{subsidy_at, Block, BlockError, BlockProcessResult, Tx};
+use crate::p2p::limits::{MAX_ONION_ENVELOPE, MEMPOOL_CAP};
+use crate::p2p::mempool::{evict_to_cap, tx_id};
 
 /// The admission verdict of a gossip handler, mapped onto the gossipsub
 /// validation report by the caller: `Accept` propagates the message,
@@ -59,6 +60,17 @@ impl Node {
             self.chain.validate_tx(&tx)
         };
         if admitted {
+            // Enforce the cap before the insert, so the bound holds at
+            // all times instead of only at housekeeping tick boundaries:
+            // a burst between ticks can otherwise push the pool far past
+            // the cap and multiply every downstream cost. Evicting room
+            // for the new entry first keeps the post-push size at or
+            // below the cap under any interleaving.
+            evict_to_cap(
+                &mut self.mempool,
+                &mut self.pairs,
+                MEMPOOL_CAP.saturating_sub(1),
+            );
             self.mempool.push(tx);
             GossipVerdict::Accept
         } else {
@@ -66,18 +78,44 @@ impl Node {
         }
     }
 
-    /// Block gossip admission: feed the ordinary block pipeline. On
-    /// success the block is rebroadcast and included transactions leave
-    /// the mempool; on a reorg the disconnected transactions are
-    /// re-validated into the mempool. A duplicate or parentless block is
-    /// ordinary network ordering and returns `Ignore`; a block refused
-    /// by validation is `Reject`.
-    pub(super) async fn handle_block(&mut self, peer: PeerId, block: Block) -> GossipVerdict {
+    /// Block gossip admission: feed the ordinary block pipeline and
+    /// report how many bytes the block parked in a retention pool on
+    /// this peer's behalf. The caller charges the sender's block bucket
+    /// for the parked size, so flooding the side-fork or orphan pools
+    /// starves the flooder's own gossip budget: every parked block
+    /// costs tokens beyond the admission price and zeroes the bucket
+    /// whenever the bytes exceed the balance. Main-chain extensions and
+    /// reorgs park nothing and are never charged. On success the block
+    /// is rebroadcast — except while the node is catching up, when the
+    /// inbound flow is historical bulk sync and republishing it would
+    /// only cost egress and invite duplicate-strike churn — and included
+    /// transactions leave the mempool; on a reorg the disconnected
+    /// transactions are re-validated into the mempool. A duplicate or
+    /// parentless block is ordinary network ordering and returns
+    /// `Ignore`; a block refused by validation is `Reject`.
+    pub(super) async fn handle_block(
+        &mut self,
+        peer: PeerId,
+        block: Block,
+    ) -> (GossipVerdict, u64) {
         if self.is_banned(&peer) {
-            return GossipVerdict::Ignore;
+            return (GossipVerdict::Ignore, 0);
         }
+        // The serialized size is computed once: it prices the parking
+        // charge and, for accepted main-chain blocks, the rebroadcast.
+        let size = bincode::serialize(&block)
+            .map(|b| b.len() as u64)
+            .unwrap_or(0);
         match self.chain.process_block(block.clone()) {
-            Ok(_) => {
+            Ok(result) => {
+                // Only retention in the side-fork or orphan pool parks
+                // memory on the sender's behalf; every other outcome
+                // either applies the block to the main chain or discards
+                // it.
+                let parked = match result {
+                    BlockProcessResult::SideFork | BlockProcessResult::Orphan => size,
+                    _ => 0,
+                };
                 if !self.chain.reorg_disconnected.is_empty() {
                     let disconnected: Vec<Block> =
                         std::mem::take(&mut self.chain.reorg_disconnected);
@@ -103,26 +141,37 @@ impl Node {
                 let included: std::collections::HashSet<Vec<u8>> =
                     block.txs.iter().map(tx_id).collect();
                 self.mempool.retain(|t| !included.contains(&tx_id(t)));
-                let gossip = bincode::serialize(&block).unwrap_or_default();
-                let _ = self.swarm.behaviour_mut().gossipsub.publish(
-                    IdentTopic::new(super::super::behaviour::TOPIC_BLOCKS),
-                    gossip,
-                );
-                GossipVerdict::Accept
+                // Rebroadcast to the mesh — but not while the node is in
+                // bulk sync: during catch-up the inbound flow is
+                // historical ranges arriving faster than gossipsub's
+                // message cache can suppress re-deliveries, and
+                // republishing them to the entire mesh costs egress while
+                // inviting the duplicate-strike interactions that expired
+                // cache entries produce. Sync traffic rides the
+                // request-response channel; the gossip rebroadcast
+                // resumes when the flag clears.
+                if !self.syncing {
+                    let gossip = bincode::serialize(&block).unwrap_or_default();
+                    let _ = self.swarm.behaviour_mut().gossipsub.publish(
+                        IdentTopic::new(super::super::behaviour::TOPIC_BLOCKS),
+                        gossip,
+                    );
+                }
+                (GossipVerdict::Accept, parked)
             }
-            Err(BlockError::Duplicate) | Err(BlockError::Orphan) => GossipVerdict::Ignore,
-            Err(_) => GossipVerdict::Reject,
+            Err(BlockError::Duplicate) | Err(BlockError::Orphan) => (GossipVerdict::Ignore, 0),
+            Err(_) => (GossipVerdict::Reject, 0),
         }
     }
 
-    /// Onion envelope relay: replay-cache check, then peel. An envelope
-    /// with hops remaining is forwarded to the next relay by unicast; an
-    /// exit envelope is decrypted and the inner transaction is admitted
-    /// exactly like plaintext gossip, so an onion transaction and a
-    /// plaintext transaction follow identical consensus rules. A replayed
-    /// envelope and an envelope whose next relay is no longer in the
-    /// routing table are honest network churn and return `Ignore`; an
-    /// undecryptable or malformed envelope is `Reject`.
+    /// Onion envelope relay: length guard, replay-cache check, then peel.
+    /// An envelope with hops remaining is forwarded to the next relay by
+    /// unicast; an exit envelope is decrypted and the inner transaction
+    /// is admitted exactly like plaintext gossip, so an onion transaction
+    /// and a plaintext transaction follow identical consensus rules. A
+    /// replayed envelope and an envelope whose next relay is no longer in
+    /// the routing table are honest network churn and return `Ignore`; an
+    /// oversized or undecryptable or malformed envelope is `Reject`.
     ///
     /// The replay cache records an identifier only after the envelope
     /// has proven itself — deserialized, peeled or decrypted, and either
@@ -132,6 +181,17 @@ impl Node {
     pub(super) async fn handle_onion(&mut self, peer: PeerId, data: &[u8]) -> GossipVerdict {
         if self.is_banned(&peer) {
             return GossipVerdict::Ignore;
+        }
+        // Length guard before the allocation-heavy deserialization: an
+        // honest envelope is a few KiB per layer — the fixed 1024-byte
+        // layer bodies plus the 2048-byte inner transaction — so a frame
+        // beyond the serving bound cannot be a valid onion and dies at a
+        // comparison instead of a 10 MiB deserialize. The bound is local
+        // admission policy like MAX_FRAME and sits after the sender's
+        // token buckets have priced the message; consensus never sees
+        // these bytes.
+        if data.len() > MAX_ONION_ENVELOPE {
+            return GossipVerdict::Reject;
         }
         let id = *blake3::hash(data).as_bytes();
         if self.seen_onions.contains(id) {

@@ -13,17 +13,23 @@
 //!   treasury-signing fixtures (`with_signer`, `sign_treasury`)
 //! - `mining` — the PoW slot mint and single-page mining rules
 //! - `transfers` — ownership, overspend, and cross-page balance rules
+//! - `transfers_locks` — lock expiry semantics through the engine
 //! - `treasury` — treasury signer enforcement and unissued-supply debits
 //! - `locks` — the lock map semantics on mining and spends
 //! - `merkle` — page roots, proofs, and the global root
-//! - `selection` — canonical selection golden vectors and page surgery
+//! - `selection` — canonical selection golden vectors and scan
+//!   priorities
+//! - `selection_sweep` — the unlocked sweep, page surgery, interior
+//!   locks, and fee-claim validation
 
 mod engine;
 mod locks;
 mod merkle;
 mod mining;
 mod selection;
+mod selection_sweep;
 mod transfers;
+mod transfers_locks;
 mod treasury;
 
 use super::page::{verify_page_proof, Output, Page, R};

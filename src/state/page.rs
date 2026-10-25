@@ -1,118 +1,149 @@
-//! The materialized page: a gapless, sorted range map with its Merkle tree.
+//! One page of the ledger: the sorted range map, the cached Merkle
+//! commitment, and the ownership mutation primitives. Pages hold at most
+//! PAGE_SIZE cells, addressed by page-relative offsets; global cell
+//! indices translate to pages through `page_id`. A pristine page is the
+//! single canonical treasury range, so a dirty page that returns to it
+//! is dropped entirely — the commitment of a missing page is recomputed
+//! from the pristine form on demand.
 //!
-//! A page stores ownership as a map from range start offset to the range
-//! data (exclusive end and owner). The invariants — non-empty map, sorted
-//! gapless non-overlapping ranges, eager merging of same-owner neighbours —
-//! are enforced by every mutation path, so the Merkle commitment over the
-//! range leaves always reflects a well-formed ownership function.
+//! The Merkle machinery lives in two focused child modules: `tree_impl`
+//! holds the cached level stack, and `proof_impl` holds the public proof
+//! structure and its verification. Both are plain data over the range
+//! map; this file keeps the Page type and every ownership operation.
 
-use super::params::TREASURY;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// One ownership range inside a page. Field names are single letters to
-/// keep the bincode storage format compact; the range start is the map key.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[path = "page_tree.rs"]
+mod tree_impl;
+#[path = "page_proof.rs"]
+mod proof_impl;
+
+pub(crate) use tree_impl::PageTree;
+pub use proof_impl::{verify_page_proof, PageProof};
+
+/// One range inside a page map: the exclusive end offset and the owner.
+/// The start offset is the map key, so the map is always dense and
+/// sorted.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct R {
-    /// Exclusive end offset within the page.
+    /// Exclusive end offset inside the page.
     pub e: u64,
-    /// Owner of every cell in [start, end).
+    /// Owner of every cell in the range.
     pub o: [u8; 32],
 }
 
-/// An output assigns a global cell range to a recipient, optionally locked
-/// until a height. Field names are short for the same storage-format reason
-/// as R.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+/// A transaction output: a half-open global range and the recipient.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Output {
-    /// Global start cell index (inclusive).
+    /// Global start cell, inclusive.
     pub start: u64,
-    /// Global end cell index (exclusive).
+    /// Global end cell, exclusive.
     pub end: u64,
-    /// Recipient address.
+    /// Recipient.
     pub to: [u8; 32],
-    /// Optional lock height: the cells are unspendable until this absolute
-    /// height. None means immediately spendable.
+    /// If `Some(H)`, the cells are locked until height `H`.
     pub lock: Option<u64>,
 }
 
-/// A materialized page with its ownership ranges. Invariants, enforced by
-/// every mutation path:
-/// - the range map is non-empty for a materialized page
-/// - keys are sorted; ranges are gapless and non-overlapping
-/// - adjacent ranges always have different owners (eager merge)
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// One ledger page: the sorted range map plus the cached Merkle
+/// commitment. The cache is skipped on serialization — it rebuilds on
+/// first use after load.
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Page {
-    /// Map from range start offset to range data. The end offset lives in
-    /// the value so bincode keeps the on-disk form compact.
+    /// Sorted, gapless, non-overlapping ranges keyed by start offset.
     pub ranges: BTreeMap<u64, R>,
+    /// The cached Merkle level stack of the range map. Skipped on
+    /// serialization; rebuilds on first use after load.
+    #[serde(skip)]
+    pub(crate) tree: std::sync::RwLock<Option<PageTree>>,
+}
+
+/// Clone copies the range map and starts the cache empty: the cached
+/// tree is a pure function of the ranges, so a fresh cache on the clone
+/// recomputes byte-identical values on first use while keeping clones
+/// cheap and never sharing mutable cache state between the two copies.
+impl Clone for Page {
+    fn clone(&self) -> Self {
+        Self {
+            ranges: self.ranges.clone(),
+            ..Default::default()
+        }
+    }
+}
+
+/// Equality is equality of the range map. The cached tree is a pure
+/// function of the ranges, so two pages with equal maps carry equal
+/// commitments regardless of which one has a warm cache.
+impl PartialEq for Page {
+    fn eq(&self, other: &Self) -> bool {
+        self.ranges == other.ranges
+    }
 }
 
 impl Page {
-    /// The Merkle root of a page's implicit pristine state: a single range
-    /// [0, size) owned by the treasury. This is exactly the commitment that
-    /// materializing the page and hashing it through `merkle_root` would
-    /// produce, so dirty-page eviction restores the identical root without
-    /// storing anything on disk, and the global root can commit to pristine
-    /// pages at zero storage cost.
-    pub fn pristine_root(size: u64) -> [u8; 32] {
-        let mut h = blake3::Hasher::new();
-        h.update(&0u64.to_le_bytes());
-        h.update(&size.to_le_bytes());
-        h.update(&TREASURY);
-        *h.finalize().as_bytes()
+    /// Run `f` against the cached level stack, building it on first use
+    /// after a mutation or a load. The closure runs while the guard is
+    /// held, so `f` must only read the tree and must not re-enter this
+    /// page's cache. The cheap emptiness check takes a scoped read that
+    /// is dropped before the exclusive write, so the two never overlap:
+    /// the standard RwLock is neither reentrant nor upgradable. A
+    /// poisoned lock is recovered with `into_inner` — the cache is a
+    /// pure function of the ranges, so the worst a poisoned guard can
+    /// hold is a stale value that the next invalidation discards, and
+    /// consensus must not abort on a bookkeeping panic.
+    fn with_page_tree<R>(&self, f: impl FnOnce(&PageTree) -> R) -> R {
+        {
+            let cache = self.tree.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(tree) = cache.as_ref() {
+                return f(tree);
+            }
+        }
+        let mut cache = self.tree.write().unwrap_or_else(|e| e.into_inner());
+        if cache.is_none() {
+            let leaves: Vec<[u8; 32]> = self
+                .ranges
+                .iter()
+                .map(|(&s, r)| Self::leaf_hash(s, r.e, &r.o))
+                .collect();
+            *cache = Some(PageTree::build(leaves));
+        }
+        f(cache.as_ref().expect("built above"))
     }
 
-    /// Hash one leaf of the page tree: blake3(start || end || owner).
+    /// Drop the cached level stack. Every mutation of the range map
+    /// calls this before returning, so the next read rebuilds against
+    /// the fresh ranges; refusal paths leave the cache untouched because
+    /// the map did not change.
+    fn invalidate_tree(&self) {
+        *self.tree.write().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// The Merkle root of the range map: blake3 leaves over
+    /// start || end || owner, hashed up in deterministic pairs.
+    pub fn merkle_root(&self) -> [u8; 32] {
+        if self.ranges.is_empty() {
+            panic!("merkle_root of an empty page");
+        }
+        self.with_page_tree(|tree| tree.root())
+    }
+
+    /// The root commitment of a pristine (never-touched) page: a single
+    /// range spanning the whole page owned by the treasury. Materialized
+    /// pages of that form are evicted from memory and disk, so this is
+    /// also the commitment every clean page contributes to the global
+    /// root without ever being stored.
+    pub fn pristine_root(page_size: u64) -> [u8; 32] {
+        Self::leaf_hash(0, page_size, &super::params::TREASURY)
+    }
+
+    /// The blake3 leaf hash: start || end || owner, all little-endian.
     fn leaf_hash(start: u64, end: u64, owner: &[u8; 32]) -> [u8; 32] {
         let mut h = blake3::Hasher::new();
         h.update(&start.to_le_bytes());
         h.update(&end.to_le_bytes());
         h.update(owner);
         *h.finalize().as_bytes()
-    }
-
-    /// The Merkle root of this page's range leaves. Panics on an empty
-    /// range map: a materialized page must always carry at least one range,
-    /// and hashing an empty map would silently root a wrong implicit page.
-    pub fn merkle_root(&self) -> [u8; 32] {
-        if self.ranges.is_empty() {
-            panic!("merkle_root of an empty page");
-        }
-        let leaves: Vec<[u8; 32]> = self
-            .ranges
-            .iter()
-            .map(|(&s, r)| Self::leaf_hash(s, r.e, &r.o))
-            .collect();
-        Self::merkle_root_of_leaves(&leaves)
-    }
-
-    /// Compute the Merkle root from a pre-hashed leaf list, duplicating the
-    /// final leaf whenever a level has odd length so the tree shape is fully
-    /// determined by the leaf count alone.
-    fn merkle_root_of_leaves(leaves: &[[u8; 32]]) -> [u8; 32] {
-        if leaves.is_empty() {
-            panic!("merkle_root of an empty leaf list");
-        }
-        if leaves.len() == 1 {
-            return leaves[0];
-        }
-        let mut level: Vec<[u8; 32]> = leaves.to_vec();
-        while level.len() > 1 {
-            let mut next = Vec::with_capacity(level.len().div_ceil(2));
-            for chunk in level.chunks(2) {
-                let mut h = blake3::Hasher::new();
-                h.update(&chunk[0]);
-                if chunk.len() == 2 {
-                    h.update(&chunk[1]);
-                } else {
-                    h.update(&chunk[0]);
-                }
-                next.push(*h.finalize().as_bytes());
-            }
-            level = next;
-        }
-        level[0]
     }
 
     /// Build a Merkle proof for the range containing the given page-local
@@ -128,57 +159,38 @@ impl Page {
             .keys()
             .position(|k| *k == range_start)
             .expect("range came from the map");
-        let leaves: Vec<[u8; 32]> = self
-            .ranges
-            .iter()
-            .map(|(&s, r)| Self::leaf_hash(s, r.e, &r.o))
-            .collect();
-        // Recompute the leaf hash explicitly so the proof is self-contained
-        // even if the leaf list construction ever changes.
-        let mut leaf_hasher = blake3::Hasher::new();
-        leaf_hasher.update(&range_start.to_le_bytes());
-        leaf_hasher.update(&range.e.to_le_bytes());
-        leaf_hasher.update(&range.o);
-        let leaf_hash = *leaf_hasher.finalize().as_bytes();
-        let mut siblings = Vec::new();
-        let mut idx = leaf_index;
-        let mut level: Vec<[u8; 32]> = leaves;
-        while level.len() > 1 {
-            let sibling = if idx.is_multiple_of(2) {
-                // Even index: sibling is the right neighbour, or the leaf
-                // itself when the level has an odd length (duplicated
-                // leaf); the last leaf of an odd level has no right
-                // neighbour in the vector.
-                *level.get(idx + 1).unwrap_or(&level[idx])
-            } else {
-                level[idx - 1]
-            };
-            siblings.push(sibling);
-            let mut next = Vec::with_capacity(level.len().div_ceil(2));
-            for chunk in level.chunks(2) {
-                let mut h = blake3::Hasher::new();
-                h.update(&chunk[0]);
-                if chunk.len() == 2 {
-                    h.update(&chunk[1]);
-                } else {
-                    h.update(&chunk[0]);
-                }
-                next.push(*h.finalize().as_bytes());
+        // The cached level stack serves the whole path: the leaf hash
+        // comes straight from the leaf vector and every sibling is read
+        // from the level the node sits in, so no range is re-hashed per
+        // proof request. The walk follows the cached parent chain: one
+        // sibling per level transition, exactly the reductions the root
+        // was built with — a single-range page has no transitions and
+        // gets an empty path whose root is the leaf itself. Each level
+        // uses the same pairing the root was built with, so the path
+        // verifies against the cached root by construction.
+        Some(self.with_page_tree(|tree| {
+            let leaf_hash = tree.leaves[leaf_index];
+            let mut siblings = Vec::with_capacity(tree.levels.len());
+            let mut idx = leaf_index;
+            let mut level: &[[u8; 32]] = &tree.leaves;
+            for parent in &tree.levels {
+                siblings.push(PageTree::sibling_at(level, idx));
+                idx /= 2;
+                level = parent;
             }
-            idx /= 2;
-            level = next;
-        }
-        Some(PageProof {
-            leaf_hash,
-            siblings,
-            leaf_index,
-        })
+            PageProof {
+                leaf_hash,
+                siblings,
+                leaf_index,
+            }
+        }))
     }
 
-    /// Insert [start, end) owned by `owner`, merging with adjacent ranges of
-    /// the same owner. The caller guarantees the span is currently free, so
-    /// the insert can never create an overlap.
+    /// Insert [start, end) owned by `owner`, merging with adjacent ranges
+    /// of the same owner. The caller guarantees the span is currently
+    /// free, so the insert can never create an overlap.
     pub fn insert_output(&mut self, start: u64, end: u64, owner: [u8; 32]) {
+        self.invalidate_tree();
         self.ranges.insert(start, R { e: end, o: owner });
         self.merge_at(start);
     }
@@ -195,8 +207,8 @@ impl Page {
                 self.ranges.remove(&at);
             }
         }
-        // Merge right, locating the current key again because a left merge
-        // may have re-keyed it.
+        // Merge right, locating the current key again because a left
+        // merge may have re-keyed it.
         let cur = *self.ranges.range(..=at).next_back().unwrap().0;
         if let Some((&ns, nr)) = self.ranges.range(cur..).nth(1) {
             if nr.o == self.ranges[&cur].o && ns == self.ranges[&cur].e {
@@ -217,18 +229,19 @@ impl Page {
         }
     }
 
-    /// Remove [start, end) from the range map. Every crossed range must be
-    /// owned by the same party; the caller verifies ownership before
+    /// Remove [start, end) from the range map. Every crossed range must
+    /// be owned by the same party; the caller verifies ownership before
     /// invoking this through remove_for_spend. Boundary ranges keep their
-    /// surviving head and tail, with the tail re-keyed at the removal end,
-    /// so the map stays gapless. Returns false — leaving the map untouched —
-    /// when the span is not covered by one contiguous run of ranges.
+    /// surviving head and tail, with the tail re-keyed at the removal
+    /// end, so the map stays gapless. Returns false — leaving the map
+    /// untouched — when the span is not covered by one contiguous run of
+    /// ranges.
     pub fn remove_range(&mut self, start: u64, end: u64) -> bool {
         // Snapshot every overlapped range so a refusal restores exact keys.
         let mut affected: Vec<(u64, R)> = Vec::new();
         for (&s, r) in self.ranges.range(..end) {
             if r.e > start {
-                affected.push((s, r.clone()));
+                affected.push((s, *r));
             }
         }
         if affected.is_empty() {
@@ -245,7 +258,7 @@ impl Page {
                 return false;
             }
         }
-        let last = affected.last().unwrap().clone();
+        let last = *affected.last().expect("non-empty after the check above");
         if last.1.e < end {
             return false;
         }
@@ -271,37 +284,7 @@ impl Page {
                 },
             );
         }
+        self.invalidate_tree();
         true
     }
-}
-
-/// A Merkle proof for one leaf of a page tree.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct PageProof {
-    /// Leaf hash: blake3(start || end || owner).
-    pub leaf_hash: [u8; 32],
-    /// Sibling hashes from the leaf up to the root.
-    pub siblings: Vec<[u8; 32]>,
-    /// Position of the leaf in the sorted range list.
-    pub leaf_index: usize,
-}
-
-/// Verify a page proof against a claimed root. Each step orders the pair by
-/// the running index parity, exactly mirroring how the tree was built.
-pub fn verify_page_proof(root: &[u8; 32], proof: &PageProof) -> bool {
-    let mut hash = proof.leaf_hash;
-    let mut idx = proof.leaf_index;
-    for sibling in &proof.siblings {
-        let mut h = blake3::Hasher::new();
-        if idx.is_multiple_of(2) {
-            h.update(&hash);
-            h.update(sibling);
-        } else {
-            h.update(sibling);
-            h.update(&hash);
-        }
-        hash = *h.finalize().as_bytes();
-        idx /= 2;
-    }
-    hash == *root
 }

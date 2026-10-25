@@ -1,22 +1,31 @@
-//! The manifest: the atomic chain snapshot. Blocks, state, and metadata
-//! are written to their stable paths first; the manifest is published
-//! last so readers always see a consistent triple. The manifest carries
-//! a content stamp for every referenced file: the stamp changes whenever
-//! the file changes, which invalidates in-memory caches keyed on the
-//! manifest bytes, and the loader verifies each stamp before
-//! deserializing so a swapped or corrupted file never loads silently.
+//! The manifest: the atomic chain snapshot, published last so readers
+//! always see a consistent triple. Every referenced file carries a
+//! content stamp verified before deserialization, so a swapped or
+//! corrupted file never loads silently. The block half is an append-only
+//! log: each save writes only the blocks mined since the previous save,
+//! so persistence cost tracks new work instead of the whole chain.
+//!
+//! The append-only block log — framing, appending, reading — lives in
+//! the `block_log` child module; this file keeps the snapshot format,
+//! the stamps, the save/load orchestration, and the legacy-layout
+//! compatibility shims.
 
 use super::{save as save_state, ChainMeta, FileStamp, Header, Manifest};
 use std::collections::BTreeMap;
 
-/// Stable on-disk filenames of the snapshot triple.
-const BLOCKS_PATH: &str = "chain_blocks.bin";
+#[path = "manifest_log.rs"]
+mod block_log;
+
+use block_log::{append_blocks_log, decode_blocks_log, read_blocks_log, read_blocks_meta};
+
+/// Stable on-disk filenames of the snapshot triple and its sidecars.
+pub(crate) const BLOCKS_PATH: &str = "blocks.log";
+const LEGACY_BLOCKS_PATH: &str = "chain_blocks.bin";
 const STATE_PATH: &str = "header.bin";
 const META_PATH: &str = "chain_meta.bin";
 const MANIFEST_PATH: &str = "manifest.bin";
 
-/// Stamp freshly serialized bytes: their length and a BLAKE3 digest over
-/// their exact content.
+/// Stamp freshly serialized bytes: length plus a BLAKE3 digest.
 fn stamp_bytes(bytes: &[u8]) -> FileStamp {
     FileStamp {
         len: bytes.len() as u64,
@@ -24,13 +33,10 @@ fn stamp_bytes(bytes: &[u8]) -> FileStamp {
     }
 }
 
-/// Stamp a file already on disk. Used for the state half of the snapshot,
-/// which `save_state` serializes internally: reading the just-written
-/// file back is safe because this process wrote it atomically moments
-/// ago. A read failure stamps a zero length, which the load-side check
-/// then rejects.
+/// Stamp a file already on disk; a read failure stamps a zero length,
+/// which the load-side check then rejects.
 fn stamp_path(path: &str) -> FileStamp {
-    std::fs::read(path)
+    std::fs::read(super::data_path(path))
         .map(|b| stamp_bytes(&b))
         .unwrap_or(FileStamp {
             len: 0,
@@ -39,12 +45,11 @@ fn stamp_path(path: &str) -> FileStamp {
 }
 
 /// Verify one data file against its recorded stamp before any
-/// deserialization happens. A length mismatch avoids hashing the file; a
-/// digest mismatch means the file was swapped, truncated, or corrupted
-/// after the snapshot was published. Either way the load aborts with a
-/// named diagnostic instead of restoring a mixed triple.
+/// deserialization: a length mismatch avoids hashing, a digest mismatch
+/// means the file changed after the snapshot was published, and either
+/// aborts the load instead of restoring a mixed triple.
 fn verify_stamp(path: &str, file_stamp: &FileStamp) -> anyhow::Result<Vec<u8>> {
-    let bytes = std::fs::read(path)?;
+    let bytes = std::fs::read(super::data_path(path))?;
     if bytes.len() as u64 != file_stamp.len {
         anyhow::bail!(
             "{path}: length {} does not match the manifest stamp {}",
@@ -58,14 +63,10 @@ fn verify_stamp(path: &str, file_stamp: &FileStamp) -> anyhow::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// Atomically persist a complete chain snapshot using a manifest. Writes
-/// blocks, state, and meta to stable paths, then publishes the manifest
-/// so readers always see a consistent set of files even after a crash.
-/// The metadata record includes checkpoints, version-bit deployments, and
-/// the chain identifier so a restart restores the exact governance and
-/// replay-protection state that was in effect. Each published file is
-/// stamped with its byte length and content digest, so the manifest
-/// itself is a complete integrity record of the triple.
+/// Atomically persist a complete chain snapshot: block tail, state, and
+/// metadata first; the manifest is published last so a crash leaves a
+/// consistent triple. Every published file is stamped, so the manifest is
+/// a complete integrity record.
 pub fn save_manifest(
     blocks: &[crate::chain::Block],
     state: &crate::state::State,
@@ -77,14 +78,11 @@ pub fn save_manifest(
     // The state half: pages + header.
     save_state(state)?;
 
-    // Persist the block list.
-    let encoded_blocks = bincode::serialize(blocks)?;
-    super::atomic_write(BLOCKS_PATH, &encoded_blocks)?;
+    // Persist the block list as an append-only log: only the new tail.
+    append_blocks_log(blocks)?;
 
-    // Persist chain metadata: base height, checkpoints, deployments, and
-    // the chain identifier. Deployments, checkpoints, and the identifier
-    // are consensus state; omitting them here would silently roll back
-    // soft-fork gates and replay domains after a restart.
+    // Persist chain metadata so a restart cannot roll back soft-fork
+    // gates or replay domains.
     let encoded_meta = bincode::serialize(&ChainMeta {
         base_height,
         checkpoints: checkpoints.clone(),
@@ -93,14 +91,13 @@ pub fn save_manifest(
     })?;
     super::atomic_write(META_PATH, &encoded_meta)?;
 
-    // Publish the manifest last. Any reader that sees this file is
-    // guaranteed that the referenced files are complete and consistent,
-    // and the stamps make any later tampering visible at load time.
+    // Publish the manifest last: a reader that sees it is guaranteed the
+    // referenced files are complete.
     let manifest = Manifest {
         blocks_path: BLOCKS_PATH.to_string(),
         state_header_path: STATE_PATH.to_string(),
         chain_meta_path: META_PATH.to_string(),
-        blocks_stamp: stamp_bytes(&encoded_blocks),
+        blocks_stamp: stamp_path(BLOCKS_PATH),
         state_stamp: stamp_path(STATE_PATH),
         meta_stamp: stamp_bytes(&encoded_meta),
     };
@@ -108,37 +105,30 @@ pub fn save_manifest(
     Ok(())
 }
 
-/// Load the full chain record from disk: blocks, tip state, and the
-/// complete chain metadata (base height, checkpoints, version-bit
-/// deployments, chain identifier). A manifest that parses is
+/// The pre-manifest fallback: legacy fixed filenames, no verification.
+fn legacy_triple() -> anyhow::Result<(Vec<crate::chain::Block>, crate::state::State, ChainMeta)> {
+    Ok((
+        load_blocks()?,
+        super::state::load()?,
+        load_chain_meta_full()?,
+    ))
+}
+
+/// Load the full chain record from disk. A manifest that parses is
 /// authoritative: every referenced file is verified against its stamp
-/// before deserialization. A manifest that does not parse — from an
-/// older layout or from corruption — falls back to the legacy fixed
-/// filenames without verification, matching a node that has never
-/// published a manifest.
+/// before deserialization. A manifest that does not parse falls back to
+/// the legacy fixed filenames without verification.
 pub fn load_from_manifest_full(
 ) -> anyhow::Result<(Vec<crate::chain::Block>, crate::state::State, ChainMeta)> {
-    let manifest: Manifest = if let Ok(bytes) = std::fs::read(MANIFEST_PATH) {
-        match bincode::deserialize(&bytes) {
-            Ok(m) => m,
-            Err(_) => {
-                return Ok((
-                    load_blocks()?,
-                    super::state::load()?,
-                    load_chain_meta_full()?,
-                ));
-            }
-        }
-    } else {
-        return Ok((
-            load_blocks()?,
-            super::state::load()?,
-            load_chain_meta_full()?,
-        ));
+    let Ok(bytes) = std::fs::read(super::data_path(MANIFEST_PATH)) else {
+        return legacy_triple();
+    };
+    let Ok(manifest) = bincode::deserialize::<Manifest>(&bytes) else {
+        return legacy_triple();
     };
 
     let blocks_bytes = verify_stamp(&manifest.blocks_path, &manifest.blocks_stamp)?;
-    let blocks: Vec<crate::chain::Block> = bincode::deserialize(&blocks_bytes)?;
+    let blocks = decode_blocks_log(&blocks_bytes, read_blocks_meta().map(|(_, c)| c as usize))?;
 
     let header_bytes = verify_stamp(&manifest.state_header_path, &manifest.state_stamp)?;
     let header: Header = bincode::deserialize(&header_bytes)?;
@@ -146,7 +136,7 @@ pub fn load_from_manifest_full(
     let mut pages = BTreeMap::new();
     for page_id in &header.page_ids {
         let path = format!("pages/{:04x}.bin", page_id);
-        let bytes = std::fs::read(&path)?;
+        let bytes = std::fs::read(super::data_path(&path))?;
         let page: crate::state::Page = bincode::deserialize(&bytes)?;
         pages.insert(*page_id, page);
     }
@@ -163,6 +153,9 @@ pub fn load_from_manifest_full(
         dev_fee_bps: header.dev_fee_bps,
         mine_fee_bps: header.mine_fee_bps,
         dao: header.dao,
+        emergency_flags: header.emergency_flags,
+        emergency_until: header.emergency_until,
+        touched_pages: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
     };
 
     let meta_bytes = verify_stamp(&manifest.chain_meta_path, &manifest.meta_stamp)?;
@@ -171,47 +164,44 @@ pub fn load_from_manifest_full(
     Ok((blocks, state, meta))
 }
 
-/// Backward-compatible view of `load_from_manifest_full` that returns only
-/// the base height and discards the governance metadata. New code should
-/// prefer the full variant so checkpoints, deployments, and the chain
-/// identifier survive a restart.
+/// Backward-compatible view returning only the base height; prefer the
+/// full variant.
 pub fn load_from_manifest() -> anyhow::Result<(Vec<crate::chain::Block>, crate::state::State, u64)>
 {
     let (blocks, state, meta) = load_from_manifest_full()?;
     Ok((blocks, state, meta.base_height))
 }
 
-/// Atomically persist a block list to `chain_blocks.bin`. Uses the same
-/// temp-write + rename strategy for crash safety.
+/// Persist a block list to the legacy full-file layout.
 pub fn save_blocks(blocks: &[crate::chain::Block]) -> anyhow::Result<()> {
     let encoded = bincode::serialize(blocks)?;
-    Ok(super::atomic_write(BLOCKS_PATH, &encoded)?)
+    Ok(super::atomic_write(LEGACY_BLOCKS_PATH, &encoded)?)
 }
 
-/// Load a block list from `chain_blocks.bin`.
+/// Load a block list: the append-only log when its meta sidecar exists,
+/// otherwise the legacy full file.
 pub fn load_blocks() -> std::result::Result<Vec<crate::chain::Block>, anyhow::Error> {
-    let bytes = std::fs::read(BLOCKS_PATH)?;
+    if read_blocks_meta().is_some() {
+        if let Ok(blocks) = read_blocks_log() {
+            return Ok(blocks);
+        }
+    }
+    let bytes = std::fs::read(super::data_path(LEGACY_BLOCKS_PATH))?;
     Ok(bincode::deserialize(&bytes)?)
 }
 
-/// Persist the full chain metadata record: base height, checkpoints,
-/// version-bit deployments, and the chain identifier. All fields are
-/// written atomically so a crash can never mix an old base height with
-/// new governance state.
+/// Persist the full chain metadata record atomically.
 pub fn save_chain_meta_full(meta: &ChainMeta) -> anyhow::Result<()> {
     Ok(super::atomic_write(META_PATH, &bincode::serialize(meta)?)?)
 }
 
-/// Load the stored chain metadata. Returns an error when the metadata file
-/// is missing or corrupt; callers treat a missing file as "no metadata
-/// yet".
+/// Load the stored chain metadata; a missing file reads as no metadata.
 pub fn load_chain_meta_full() -> anyhow::Result<ChainMeta> {
-    let bytes = std::fs::read(META_PATH)?;
+    let bytes = std::fs::read(super::data_path(META_PATH))?;
     Ok(bincode::deserialize(&bytes)?)
 }
 
-/// Save the current base height so that pruned nodes know where their
-/// block window starts.
+/// Save the current base height for pruned nodes.
 pub fn save_chain_meta(base_height: u64) -> anyhow::Result<()> {
     save_chain_meta_full(&ChainMeta {
         base_height,
@@ -224,24 +214,22 @@ pub fn load_chain_meta() -> anyhow::Result<u64> {
     Ok(load_chain_meta_full()?.base_height)
 }
 
-/// Write bytes to a file atomically: write to a temporary name, fsync,
-/// rename over the target, fsync the parent directory. A crash therefore
-/// leaves either the previous or the next content of the file, never a
-/// torn write.
+/// Write bytes atomically: temp name, fsync, rename, fsync the parent;
+/// a crash leaves either the previous or the next content. The target
+/// resolves against the library data directory.
 pub fn atomic_write(path: &str, data: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
-    let tmp = format!("{}.tmp", path);
+    let target = super::data_path(path);
+    let tmp = target.with_extension("tmp");
     {
         let mut file = std::fs::File::create(&tmp)?;
         file.write_all(data)?;
         file.sync_all()?;
     }
-    std::fs::rename(&tmp, path)?;
-    if let Some(parent) = std::path::Path::new(path).parent() {
-        if !parent.as_os_str().is_empty() {
-            if let Ok(dir) = std::fs::File::open(parent) {
-                let _ = dir.sync_all();
-            }
+    std::fs::rename(&tmp, &target)?;
+    if let Some(parent) = target.parent().filter(|p| !p.as_os_str().is_empty()) {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
         }
     }
     Ok(())

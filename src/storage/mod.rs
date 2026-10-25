@@ -4,6 +4,12 @@
 //! torn file. The manifest is published last: a reader that sees it is
 //! guaranteed that the referenced files are complete and consistent.
 //!
+//! Every on-chain path is resolved against the library data directory:
+//! once `slash_init` installs a base, all file access stays inside it
+//! without ever changing the process working directory, so an embedding
+//! application's own relative-path I/O is never re-anchored as a side
+//! effect of initializing the library.
+//!
 //! Layout:
 //! - `journal` — the crash-recovery journal of applied blocks
 //! - `state` — the state header + page files (`save`/`load`)
@@ -22,6 +28,29 @@ pub use state::*;
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
+use std::sync::OnceLock;
+
+/// The library data directory. Set once through `slash_init`; while it
+/// stays unset, every relative path resolves against the current working
+/// directory, which preserves the standalone-node behavior where the
+/// process itself was started inside the data directory.
+static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// Resolve one on-chain relative path against the configured data
+/// directory. An unset base yields the plain relative path, so callers
+/// that never invoke `slash_init` observe the previous behavior exactly.
+pub(crate) fn data_path(rel: &str) -> PathBuf {
+    let base = DATA_DIR.get_or_init(|| PathBuf::from("."));
+    base.join(rel)
+}
+
+/// Install the data directory. Called by `slash_init` exactly once per
+/// process; a second call is refused so an embedding application cannot
+/// silently re-anchor an in-use library into another directory.
+pub(crate) fn set_data_dir(path: PathBuf) -> Result<(), PathBuf> {
+    DATA_DIR.set(path)
+}
 
 /// State header: the index of every dirty page plus the consensus fields
 /// that do not live inside the page files (locks, balance cache, treasury
@@ -53,6 +82,11 @@ pub(crate) struct Header {
     mine_fee_bps: u64,
     /// DAO proposals and counters.
     dao: crate::dao::DaoState,
+    /// Emergency pause state in effect at the persisted height: the flag
+    /// bits under freeze and the height at which the freeze expires, so a
+    /// restart resumes with exactly the freeze the chain had.
+    pub emergency_flags: u8,
+    pub emergency_until: u64,
 }
 
 /// Full chain metadata record: the pruned base height, the checkpoint map,

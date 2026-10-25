@@ -132,6 +132,10 @@ impl Node {
         if let Some(previous) = self.mine_cancel.replace(cancel.clone()) {
             previous.store(true, Ordering::SeqCst);
         }
+        // The search returns the timestamp it ground against as well as
+        // the nonce: a long scan advances the timestamp from the wall
+        // clock so the proof stays valid, and the block must be stamped
+        // with the same value or the header and the proof disagree.
         let found = crate::mining::mine_block(
             block.prev,
             block.time,
@@ -140,7 +144,8 @@ impl Node {
             block.difficulty,
             cancel,
         );
-        if let Some((nonce, cell)) = found {
+        if let Some((nonce, cell, effective_time)) = found {
+            block.time = effective_time;
             block.nonce = nonce;
             block.mined_cell = cell;
             block = self.chain.prepare_block(block);

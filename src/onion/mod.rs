@@ -32,6 +32,16 @@ const INNER_SIZE: usize = 2048;
 /// or last relay, so the constructor refuses shorter paths.
 pub const MIN_RELAYS: usize = 3;
 
+/// Domain tag for keys encrypting routing layers: the entry and middle
+/// layers whose plaintext carries the next relay's X25519 address.
+pub(crate) const LAYER_KEY_DOMAIN: u8 = 0x01;
+/// Domain tag for the key encrypting the inner transaction payload at
+/// the exit relay.
+pub(crate) const INNER_KEY_DOMAIN: u8 = 0x02;
+/// Domain tag for the key encrypting the final marker layer whose
+/// plaintext signals the exit condition to the last relay.
+pub(crate) const MARKER_KEY_DOMAIN: u8 = 0x03;
+
 /// Error returned when an onion envelope cannot be constructed.
 ///
 /// The error is a plain value type (rather than a panic) because envelope
@@ -42,6 +52,13 @@ pub const MIN_RELAYS: usize = 3;
 pub enum OnionError {
     /// Fewer relays than the mandatory three-hop path were supplied.
     TooFewRelays { provided: usize, required: usize },
+    /// A relay public key is low order, so every Diffie-Hellman output
+    /// against it is the all-zero string and the layer would be
+    /// encrypted under a publicly computable key.
+    LowOrderRelayKey { index: usize },
+    /// The serialized transaction does not fit into the fixed-size inner
+    /// payload even after framing, so the envelope cannot be built.
+    PayloadTooLarge { size: usize, limit: usize },
 }
 
 impl std::fmt::Display for OnionError {
@@ -51,6 +68,16 @@ impl std::fmt::Display for OnionError {
                 f,
                 "onion routing requires at least {} relays, {} provided",
                 required, provided
+            ),
+            OnionError::LowOrderRelayKey { index } => write!(
+                f,
+                "relay {} uses a low-order X25519 key and cannot secure an envelope layer",
+                index
+            ),
+            OnionError::PayloadTooLarge { size, limit } => write!(
+                f,
+                "serialized transaction of {} bytes exceeds the {}-byte inner payload",
+                size, limit
             ),
         }
     }
@@ -69,9 +96,9 @@ pub struct Layer {
 /// A 3-hop onion-wrapped transaction.
 /// The final_ephemeral field stores the X25519 public key needed by the
 /// exit relay to decrypt the inner payload after all layers are peeled away.
-/// The onion_id is a random nonce that uniquely identifies the envelope;
-/// every relay remembers recently seen identifiers and drops duplicates,
-/// which prevents replay of a captured onion into the mempool a second time.
+/// Envelopes carry no identifier field: replay protection keys on the
+/// hash of the serialized envelope bytes, which the originator cannot
+/// influence without breaking authentication.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OnionTx {
     pub layers: Vec<Layer>,
@@ -81,9 +108,6 @@ pub struct OnionTx {
     /// The final relay uses this together with its static secret to derive
     /// the AES-GCM key for the inner ciphertext.
     pub final_ephemeral: [u8; 32],
-    /// Unique random identifier carried through every peel so that each
-    /// relay can reject envelopes it has already processed.
-    pub onion_id: [u8; 32],
 }
 
 /// Result of peeling one layer.
@@ -95,16 +119,17 @@ pub struct PeelResult {
 
 /// Pad a variable-length payload to a fixed size by prepending a 2-byte length
 /// and appending zero bytes. The length prefix is hidden inside the AES-GCM ciphertext.
-fn pad_payload(data: &[u8], size: usize) -> Vec<u8> {
-    assert!(
-        data.len() + 2 <= size,
-        "payload exceeds maximum padded size"
-    );
+/// Returns None when the payload does not fit, so callers can surface a
+/// typed input error instead of aborting the host process.
+fn pad_payload(data: &[u8], size: usize) -> Option<Vec<u8>> {
+    if data.len() + 2 > size {
+        return None;
+    }
     let mut out = Vec::with_capacity(size);
     out.extend_from_slice(&(data.len() as u16).to_le_bytes());
     out.extend_from_slice(data);
     out.resize(size, 0);
-    out
+    Some(out)
 }
 
 /// Strip the length prefix and padding from a decrypted payload.

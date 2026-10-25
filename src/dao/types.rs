@@ -1,119 +1,247 @@
-//! Governance types and constants: the DAO timing and quorum parameters,
-//! the executable payload variants, the proposal lifecycle and record,
-//! and the memo-carried operations.
+//! src/dao/types.rs — the value types of the governance layer.
+//!
+//! `ProposalStatus` is the lifecycle; `Proposal` is the record the
+//! proposal table stores; `DaoOp` is the memo-carried operation. All
+//! three are plain data: every rule that moves them lives in `state.rs`,
+//! and they derive serde so the proposal table survives the state header
+//! on disk.
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 
-/// Minimum lock duration, in blocks, that a cell must carry for its owner
-/// to accrue voting weight. Locks shorter than this horizon are treated as
-/// operational (staking, escrow) rather than governance commitments.
-pub const DAO_LOCK_MIN: u64 = 10_000;
-
-/// Quorum expressed in basis points of the total locked supply. A proposal
-/// that does not attract at least this share of the total possible weight
-/// cannot pass, regardless of the yes/no split.
-pub const DAO_QUORUM_BPS: u64 = 500;
-
-/// Approval threshold in basis points of the weight that actually voted.
-/// Passing requires strictly more yes weight than this value allows to be
-/// no weight, which implements a simple majority of 50 percent plus one.
-pub const DAO_THRESHOLD_BPS: u64 = 5000;
-
-/// Length of the voting period in blocks. A proposal submitted at height H
-/// accepts votes from height H until height H + DAO_VOTING_PERIOD.
-pub const DAO_VOTING_PERIOD: u64 = 4032;
-
-/// Delay between the end of voting and executable height. Passed proposals
-/// sit in a public queue for this many blocks so that voters can observe
-/// the outcome and, if necessary, migrate funds before any state change.
-pub const DAO_EXEC_DELAY: u64 = 1008;
-
-/// Maximum number of concurrently open proposals. The bound keeps the
-/// per-block tally walk cheap and prevents proposal-spam from growing the
-/// consensus state without limit.
-pub const DAO_MAX_PROPOSALS: usize = 64;
-
-/// A typed, executable decision. Every variant names the exact state
-/// transition the DAO is authorized to perform; consensus executes the
-/// payload verbatim, so the payload itself is the single source of truth
-/// for what a passed proposal does.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub enum DaoPayload {
-    /// Mint treasury cells to a recipient. Executed through the canonical
-    /// treasury selection so every node reproduces the identical input
-    /// ranges and page roots.
-    TreasuryMint { amount: u64, to: [u8; 32] },
-    /// Pay a recipient out of the treasury vault. Fails at execution time
-    /// if the vault balance cannot cover the amount.
-    TreasuryPayout { amount: u64, to: [u8; 32] },
-    /// Replace the public key that authorizes spending from the dev fund.
-    /// Rotation takes effect at the executable height.
-    RotateDevFundSigner { public: [u8; 32] },
-    /// Replace the treasury signer key. Used for planned key rotation and
-    /// as the recovery path for a compromised signer.
-    RotateTreasurySigner { public: [u8; 32] },
-    /// Set the dev fee on user transfers, in basis points of total output.
-    /// A value of zero disables the transfer-level dev fee.
-    SetDevFee { bps: u64 },
-    /// Set the dev fee on the coinbase subsidy, in basis points of the
-    /// subsidy. A value of zero disables the mining-level dev fee.
-    SetMineFee { bps: u64 },
-}
-
-/// Lifecycle of a governance proposal.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+/// Lifecycle of one proposal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProposalStatus {
     /// Open for votes.
     Voting,
-    /// Voting ended with quorum and majority yes; waiting for the
-    /// executable height.
+    /// Closed and approved; waiting out the execution delay.
     Passed,
-    /// The payload transition was applied to state.
+    /// Closed and executed; terminal.
     Executed,
-    /// Voting ended without quorum or without a majority.
+    /// Closed without quorum or majority; terminal.
     Rejected,
-    /// The proposal was superseded or its payload became unexecutable
-    /// before the executable height.
+    /// Closed and approved but the payload was not executable at the
+    /// scheduled height; terminal.
     Expired,
 }
 
-/// A single governance proposal.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// One governance proposal. Weight is pinned at the snapshot height, so
+/// purchases and burns inside the voting window cannot move the outcome
+/// of a live proposal.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Proposal {
-    /// Monotonic identifier, unique across the lifetime of the chain.
     pub id: u64,
-    /// The decision this proposal carries.
     pub payload: DaoPayload,
-    /// First height at which votes are accepted.
+    /// The address that paid the submission fee; recorded so the origin
+    /// of every proposal is auditable on-chain.
+    pub submitter: [u8; 32],
+    /// The first height at which votes are accepted.
     pub start_height: u64,
-    /// First height at which votes are no longer accepted.
+    /// The height at which voting ends; votes land in
+    /// [start_height, end_height).
     pub end_height: u64,
-    /// Cached weight snapshot height. Voting weight is evaluated at this
-    /// height, so weight earned or lost inside the voting window cannot
+    /// The height whose locked supply decides the vote; fixed at
+    /// submission, so weight earned or burned inside the window cannot
     /// influence the outcome.
     pub snapshot_height: u64,
-    /// Accumulated yes weight.
+    /// The quorum denominator, captured at submission: the total locked
+    /// weight at the snapshot height. Cached on the record so closing a
+    /// proposal never rescans the ledger for a denominator that was
+    /// fixed the moment the proposal opened.
+    pub locked_total: u64,
     pub yes_weight: u64,
-    /// Accumulated no weight.
     pub no_weight: u64,
-    /// Addresses that already voted on this proposal. One address casts at
-    /// most one vote; the first vote is recorded and later votes from the
-    /// same address are rejected.
-    pub voters: BTreeSet<[u8; 32]>,
-    /// Current lifecycle state.
+    /// Every address that has cast a vote; the first vote wins, so the
+    /// set doubles as the duplicate-vote guard.
+    pub voters: std::collections::BTreeSet<[u8; 32]>,
     pub status: ProposalStatus,
-    /// Height at which a passed proposal becomes executable.
+    /// The height at which a passed proposal becomes executable; zero
+    /// while the proposal has not passed.
     pub exec_height: u64,
 }
 
-/// A governance operation carried by a transaction memo. The memo bytes
-/// commit into the transaction signature hash, so a signed transaction
-/// cannot be repurposed as a governance operation after signing.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// The executable effect of a passed proposal. Every variant is bounded
+/// at submission time so a passed proposal can only request transitions
+/// that can actually execute.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DaoPayload {
+    /// Mint treasury cells to an address through the canonical treasury
+    /// selection.
+    TreasuryMint { amount: u64, to: [u8; 32] },
+    /// Pay treasury-vault cells to an address.
+    TreasuryPayout { amount: u64, to: [u8; 32] },
+    /// Replace the dev fund signer.
+    RotateDevFundSigner { public: [u8; 32] },
+    /// Replace the treasury signer.
+    RotateTreasurySigner { public: [u8; 32] },
+    /// Set the dev-fee share in basis points.
+    SetDevFee { bps: u64 },
+    /// Set the coinbase dev-fee share in basis points.
+    SetMineFee { bps: u64 },
+    /// Freeze one or more operation classes until a fixed height without
+    /// stopping the chain: blocks keep arriving — coinbase, slot, and fee
+    /// claims all still execute — while the flagged classes are refused
+    /// in every block. The freeze takes effect from the block after the
+    /// carrying one, so every execution path reads the same pre-block
+    /// state and the pause cannot activate mid-block. A nonzero flag set
+    /// and a future height are required, so the payload can never request
+    /// a transition that would be inert or already expired.
+    EmergencyPause { flags: u8, until_height: u64 },
+    /// Clear the emergency pause outright, before its scheduled expiry.
+    EmergencyResume,
+}
+
+/// Provenance of cells issued by governance mints. The bonding curve
+/// funds sell payouts exclusively from payments buyers made into the
+/// treasury vault; a governance mint moves cells to a recipient without
+/// any such payment, so those cells must never acquire buy-back rights:
+/// without provenance a coalition able to pass TreasuryMint proposals
+/// could mint to an accomplice and sell the cells back at the curve sell
+/// price, draining the vault with no purchase ever occurring. The set
+/// stores merged, non-overlapping half-open ranges keyed by start cell, so
+/// membership queries scan at most one predecessor entry plus one
+/// successor entry regardless of how many mints the chain has executed.
+/// Provenance never expires: a transferred cell keeps it, exactly like
+/// physical provenance. The set rides the governance state in the state
+/// header, so it persists and replays with every snapshot and journal.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct MintProvenance(pub BTreeMap<u64, u64>);
+
+impl MintProvenance {
+    /// Record a governance-minted range. Overlapping and adjacent entries
+    /// are merged into a single span, so repeated mints into neighboring
+    /// ranges keep the map compact and queries stay bounded.
+    pub fn mark(&mut self, start: u64, end: u64) {
+        if end <= start {
+            return;
+        }
+        let mut s = start;
+        let mut e = end;
+        // Absorb the entry immediately to the left when it overlaps the
+        // new range; the span extends from that entry's start.
+        if let Some((&ls, &le)) = self.0.range(..=s).next_back() {
+            if le >= s {
+                s = ls;
+                e = e.max(le);
+            }
+        }
+        // Absorb every entry whose start falls inside the merged span:
+        // each overlaps it and can only extend its end.
+        let absorbed: Vec<(u64, u64)> = self.0.range(s..e).map(|(&k, &v)| (k, v)).collect();
+        for (k, v) in absorbed {
+            e = e.max(v);
+            self.0.remove(&k);
+        }
+        self.0.insert(s, e);
+    }
+
+    /// Whether any cell of the half-open range carries governance-mint
+    /// provenance. The predecessor entry is checked for overlap with the
+    /// range start; any entry starting inside the range covers the rest.
+    pub fn contains(&self, start: u64, end: u64) -> bool {
+        if end <= start {
+            return false;
+        }
+        if let Some((_, le)) = self.0.range(..=start).next_back() {
+            if *le > start {
+                return true;
+            }
+        }
+        self.0.range(start..end).next().is_some()
+    }
+}
+
+/// Emergency pause flag: freeze treasury curve pairs (buys and sells) in
+/// every block until the pause expires. Coinbase, slot mints, and fee
+/// claims keep executing, so the chain stays live while the vulnerable
+/// surface is closed.
+pub const EMERGENCY_TREASURY_PAIRS: u8 = 0b01;
+/// Emergency pause flag: freeze every non-coinbase transaction — the
+/// broadest circuit breaker, used when the vulnerability lives in user
+/// transaction handling itself. Governance proposals already open keep
+/// their schedule; only new transactions stop moving.
+pub const EMERGENCY_USER_TXS: u8 = 0b10;
+
+/// A governance operation carried by a transaction memo while the DaoV1
+/// rule is active. The operation applies only after the carrying
+/// transfer itself succeeds.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DaoOp {
-    /// Open a new proposal with the given payload.
     SubmitProposal { payload: DaoPayload },
-    /// Cast one vote on an existing proposal.
     Vote { proposal_id: u64, approve: bool },
+}
+
+/// Locked cells earn DAO voting weight only when the lock expires at
+/// least this many blocks past the proposal snapshot: weight is a
+/// long-horizon commitment, not a spot purchase.
+pub const DAO_LOCK_MIN: u64 = 10_000;
+
+/// Quorum denominator in basis points of the snapshot locked supply.
+pub const DAO_QUORUM_BPS: u64 = 500;
+
+/// Approval threshold in basis points of the cast weight.
+pub const DAO_THRESHOLD_BPS: u64 = 5_000;
+
+/// Blocks from submission to close.
+pub const DAO_VOTING_PERIOD: u64 = 4_032;
+
+/// Blocks from close to executable height.
+pub const DAO_EXEC_DELAY: u64 = 1_008;
+
+/// Maximum open proposals. The cap bounds the proposal table and the
+/// per-block governance pass.
+pub const DAO_MAX_PROPOSALS: usize = 64;
+
+/// Blocks a terminal proposal is kept after its voting period ends before
+/// it is pruned. The window covers the scheduled execution height, so
+/// every outcome stays observable on-chain; the table the per-block
+/// governance pass iterates then stays bounded for the node's whole life.
+pub const DAO_TERMINAL_RETENTION: u64 = DAO_VOTING_PERIOD + DAO_EXEC_DELAY;
+
+#[cfg(test)]
+mod provenance_tests {
+    use super::MintProvenance;
+
+    #[test]
+    fn disjoint_marks_query_independently() {
+        let mut p = MintProvenance::default();
+        p.mark(100, 150);
+        p.mark(300, 310);
+        assert!(p.contains(100, 150));
+        assert!(p.contains(300, 310));
+        assert!(p.contains(120, 305));
+        assert!(!p.contains(150, 300));
+        assert!(!p.contains(0, 100));
+        assert!(!p.contains(310, 400));
+    }
+
+    #[test]
+    fn overlapping_marks_merge_into_one_span() {
+        let mut p = MintProvenance::default();
+        p.mark(100, 160);
+        p.mark(150, 200);
+        assert_eq!(p.0.len(), 1);
+        assert!(p.contains(100, 200));
+        assert_eq!(p.0.get(&100), Some(&200));
+    }
+
+    #[test]
+    fn enclosing_and_nested_marks_collapse() {
+        let mut p = MintProvenance::default();
+        p.mark(120, 140);
+        p.mark(100, 200);
+        p.mark(110, 120);
+        assert_eq!(p.0.len(), 1);
+        assert_eq!(p.0.get(&100), Some(&200));
+        assert!(!p.contains(200, 201));
+    }
+
+    #[test]
+    fn empty_and_reversed_ranges_are_ignored() {
+        let mut p = MintProvenance::default();
+        p.mark(50, 50);
+        p.mark(60, 40);
+        assert!(p.0.is_empty());
+        assert!(!p.contains(50, 60));
+    }
 }

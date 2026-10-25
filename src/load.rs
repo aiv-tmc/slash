@@ -7,13 +7,17 @@
 use crate::{active_chain_id, chain, state, storage};
 use std::sync::atomic::Ordering;
 
+/// The load-time sanity package: a freshly restored triple is verified
+/// as one coherent chain before it drives consensus, so a stamp-clean
+/// but internally inconsistent restore falls back to snapshot recovery
+/// instead of wedging block by block.
+#[path = "load_sanity.rs"]
+mod sanity;
+
 /// Enforce that on-disk chain data belongs to the replay domain the node
-/// was started for. The persisted identifier is authoritative: a node
-/// started with the wrong network flag must refuse to operate on the data
-/// instead of silently reinterpreting every signature hash under the other
-/// domain, which would otherwise open a cross-network replay path.
-/// An empty persisted identifier marks legacy data written before the
-/// field existed; such data is adopted under the active mode.
+/// was started for: the persisted identifier is authoritative, a mismatch
+/// panics, and an empty persisted identifier marks data written before
+/// the field existed and is adopted under the active mode.
 fn enforce_chain_id(persisted: &[u8], active: &[u8]) {
     if !persisted.is_empty() && persisted != active {
         panic!(
@@ -26,14 +30,12 @@ fn enforce_chain_id(persisted: &[u8], active: &[u8]) {
 }
 
 /// Validate a restored version-bit deployment table before it drives
-/// consensus. The table comes from local on-disk metadata; an entry whose
-/// bit position leaves the 32-bit version field would make the
-/// signal-count shift overflow — a panic in debug builds and a silently
-/// masked shift amount in release builds — and an entry whose threshold
-/// exceeds the retarget window can never accumulate the required signal
-/// count inside one window, so either defect means the metadata is
-/// corrupt. The node refuses to operate on a corrupt table rather than
-/// reinterpret the activation schedule.
+/// consensus. Structural checks reject a bit position outside the 32-bit
+/// version field (the signal-count shift would overflow) and a threshold
+/// beyond the retarget window (such a deployment could never lock in).
+/// Coherence checks reject states the machine never writes: only LockedIn
+/// and Active carry a scheduled activation height, and Failed never
+/// carries a signal tally.
 fn enforce_deployment_table(deployments: &[chain::Deployment]) {
     for d in deployments {
         if d.bit >= 32 || d.threshold as u64 > chain::DIFFICULTY_ADJUSTMENT_INTERVAL {
@@ -43,19 +45,54 @@ fn enforce_deployment_table(deployments: &[chain::Deployment]) {
                 d.name, d.bit, d.threshold
             );
         }
+        let scheduled = matches!(
+            d.status,
+            chain::DeploymentStatus::LockedIn | chain::DeploymentStatus::Active
+        );
+        if scheduled != d.activation_height.is_some() {
+            panic!(
+                "[load] incoherent deployment table: entry '{}' in state {:?} \
+                 carries activation_height {:?}; refusing to load",
+                d.name, d.status, d.activation_height
+            );
+        }
+        if d.status == chain::DeploymentStatus::Failed && d.signals != 0 {
+            panic!(
+                "[load] incoherent deployment table: failed entry '{}' \
+                 carries a stale signal tally {}; refusing to load",
+                d.name, d.signals
+            );
+        }
     }
 }
 
-/// Replay the crash-recovery journal into a freshly loaded chain. Every
-/// record was fully validated before it was written, so replay skips the
-/// header checks (including the RandomX proof) and relies on the linkage
-/// and state checks in apply_recovered: stale or torn records fail the
-/// height/prev linkage, and corrupted payloads fail the state transition
-/// or the page-root verification. The committed tip is reconstructed
-/// exactly without a per-block proof-of-work pass during startup.
+/// Replay the crash-recovery journal into a freshly loaded chain. Replay
+/// skips the header checks (including the RandomX proof) and relies on
+/// the linkage and state checks in apply_recovered. Replay stops at the
+/// first record the chain refuses — every later record presumes the
+/// failed one — and the journal is rewritten to exactly the applied
+/// prefix so the discarded tail cannot be replayed after the next
+/// restart either.
 fn recover(mut chain: chain::Chain) -> chain::Chain {
-    for b in storage::journal_load() {
-        let _ = chain.apply_recovered(b);
+    let journal = storage::journal_load();
+    let mut applied = 0usize;
+    for b in &journal {
+        if let Err(err) = chain.apply_recovered(b.clone()) {
+            eprintln!(
+                "[load] journal replay refused the record at height {}: {:?}; \
+                 recovery stops and the journal is truncated to the applied prefix",
+                b.height, err
+            );
+            break;
+        }
+        applied += 1;
+    }
+    if applied < journal.len() {
+        // The records past the cut presume the refused record; the
+        // journal is rebuilt from exactly the applied prefix, truncated
+        // first so an interrupted rewrite still leaves a consistent file.
+        let _ = storage::journal_truncate();
+        let _ = storage::journal_append_batch(&journal[..applied]);
     }
     let tip_len = chain.blocks.len() as u64;
     let tip = tip_len.saturating_add(chain.base_height).saturating_sub(1);
@@ -63,19 +100,13 @@ fn recover(mut chain: chain::Chain) -> chain::Chain {
     chain
 }
 
-/// Rebuild the state history on a freshly loaded chain. The manifest
-/// persists only the tip state, so the reorg machinery would otherwise have
-/// no historical states to restore. An exact anchor is required: the genesis
-/// state for a short chain, the snapshot taken exactly before the first
-/// stored block of a pruned chain, or the newest snapshot at or below the
-/// reorg window of a long chain.
-///
-/// The replay is always bounded by HISTORY_REBUILD_MAX_REPLAY so recovery
-/// time stays proportional to the snapshot spacing instead of the full
-/// chain length. When no exact anchor exists within the bound the history is
-/// deliberately left empty, which makes every reorg attempt fail closed with
-/// BlockError::CannotReorgBeyondHistory instead of rolling back to a
-/// fabricated state that would corrupt balances.
+/// Rebuild the state history on a freshly loaded chain; the manifest
+/// persists only the tip state, so the reorg machinery would otherwise
+/// have no historical states to restore. An exact anchor is required —
+/// genesis for a short chain, the snapshot before the first stored block
+/// for a pruned chain, the newest snapshot inside the reorg window for a
+/// long one — and the replay never exceeds HISTORY_REBUILD_MAX_REPLAY;
+/// with no exact anchor the history stays empty and reorgs fail closed.
 fn restore_history(chain: &mut chain::Chain) {
     let tip = (chain.blocks.len() as u64)
         .saturating_add(chain.base_height)
@@ -84,19 +115,13 @@ fn restore_history(chain: &mut chain::Chain) {
         // Short full chain: replaying from genesis stays inside the bound.
         Some((state::State::genesis(), 0u64))
     } else if chain.base_height > 0 {
-        // The state right after block base_height - 1 is the only valid
-        // replay start for the stored block window; the window never
-        // exceeds the replay bound by construction. Snapshot records are
-        // stored as (height, state), while rebuild_state_history consumes
-        // (state, height), so the tuple is reordered here.
+        // The state after block base_height - 1 is the only valid replay
+        // start for the stored window, which never exceeds the bound.
         let want = chain.base_height - 1;
-        storage::load_latest_snapshot(want).ok().and_then(|(h, s)| {
-            if h == want {
-                Some((s, h))
-            } else {
-                None
-            }
-        })
+        storage::load_latest_snapshot(want)
+            .ok()
+            .filter(|(h, _)| *h == want)
+            .map(|(h, s)| (s, h))
     } else {
         // Long full chain: the newest snapshot at or below the reorg
         // window is the only anchor cheap enough to replay from.
@@ -109,28 +134,22 @@ fn restore_history(chain: &mut chain::Chain) {
             .rebuild_state_history(anchor_state, anchor_height)
             .is_err()
         {
-            // A replay failure indicates on-disk corruption of the block
-            // list or the state. Without a trustworthy history every reorg
-            // must be rejected, so the partial result is discarded.
+            // Replay failure means corruption; without a trustworthy
+            // history every reorg must be rejected.
             chain.state_history.clear();
         }
     }
-    // With no anchor available the history stays empty by design: reorgs
-    // are refused until enough new blocks extend the window.
 }
 
-/// Load chain, recovering from snapshot when live state files are damaged.
-/// First attempts a manifest-based load; if that fails, uses the latest
-/// snapshot and replays any blocks that exist after the snapshot height.
-///
-/// Governance state (checkpoints, version-bit deployments) is always restored
-/// from the persisted metadata, and the state history is either rebuilt from
-/// an exact anchor or left empty so that reorgs fail closed. The persisted
-/// chain identifier is authoritative: a node started with the wrong network
-/// flag refuses to operate on the data instead of silently switching replay
-/// domains. The node never operates on fabricated history after a restart.
+/// Load the chain, recovering from the most recent snapshot when the live
+/// state files are damaged. First attempts a manifest-based load; on
+/// failure uses the latest snapshot and replays the blocks stored after
+/// the snapshot height. Governance metadata is always validated before
+/// it drives consensus, and the state history is either rebuilt from an
+/// exact anchor or left empty so reorgs fail closed.
 pub fn load_pruned() -> chain::Chain {
-    // Attempt a manifest-based load first for crash consistency.
+    // Manifest load first: the manifest is written last by every
+    // consistent save, so its presence certifies the triple.
     if let Ok((blocks, state, meta)) = storage::load_from_manifest_full() {
         let active = active_chain_id();
         enforce_chain_id(&meta.chain_id, &active);
@@ -159,83 +178,103 @@ pub fn load_pruned() -> chain::Chain {
                 String::from_utf8_lossy(&meta.chain_id).into_owned()
             },
             // The testnet flag mirrors the process-wide network selector
-            // so the rebuilt chain signs and validates against the same
-            // chain identifier the rest of the node uses.
+            // so the rebuilt chain signs against the same chain id the
+            // rest of the node uses.
             testnet: crate::TESTNET_MODE.load(Ordering::Relaxed),
             orphan_blocks: std::collections::HashMap::new(),
             side_forks: std::collections::HashMap::new(),
             reorg_disconnected: Vec::new(),
         };
-        restore_history(&mut chain);
-        return recover(chain);
+        // The stamps certify the files as one atomic write; the sanity
+        // package certifies the triple as one coherent chain. A shifted
+        // height coordinate, a checkpoint disagreement, or a broken
+        // conservation invariant means the files came from different
+        // moments even though every file matches its stamp, and
+        // continuing on such a triple would wedge the node block by
+        // block — so a failure falls through to snapshot recovery with
+        // the named diagnostic instead of driving consensus.
+        if let Err(reason) = sanity::sanity_check(&chain) {
+            eprintln!(
+                "[load] manifest triple failed the sanity package ({reason}); \
+                 falling back to snapshot recovery"
+            );
+        } else {
+            restore_history(&mut chain);
+            return recover(chain);
+        }
     }
 
-    // Normal load failed: recover from the most recent snapshot.
-    let (snap_height, state) =
-        storage::load_latest_snapshot(u64::MAX).unwrap_or_else(|_| (0, state::State::genesis()));
+    // Normal load failed: recover from the most recent snapshot. When the
+    // snapshot record carries a deployment table and checkpoint map, the
+    // retained window replays from exactly that table — every applied
+    // block advances it through the ordinary commit path — so the
+    // in-memory deployments become a pure function of the snapshot plus
+    // the retained blocks instead of a trusted copy of whatever a
+    // previous process persisted. A legacy bare-state snapshot carries no
+    // governance and is backfilled from the persisted metadata below.
+    let fallback = storage::SnapshotRecord {
+        state: state::State::genesis(),
+        deployments: Vec::new(),
+        checkpoints: std::collections::BTreeMap::new(),
+    };
+    let (snap_height, record) =
+        storage::load_latest_snapshot_record(u64::MAX).unwrap_or((0, fallback));
     let active = active_chain_id();
     let mut chain = chain::Chain {
         blocks: Vec::new(),
         base_height: snap_height,
-        state,
+        state: record.state,
         state_history: std::collections::HashMap::new(),
         deployments_history: std::collections::HashMap::new(),
-        checkpoints: std::collections::BTreeMap::new(),
+        checkpoints: record.checkpoints,
         version_bits: chain::VersionBits {
-            // The snapshot carries no governance state: the deployment
-            // list starts empty and re-learns activations from new blocks.
-            deployments: Vec::new(),
+            deployments: record.deployments,
         },
         chain_id: String::from_utf8_lossy(&active).into_owned(),
-        // The testnet flag mirrors the process-wide network selector
-        // so the rebuilt chain signs and validates against the same
-        // chain identifier the rest of the node uses.
         testnet: crate::TESTNET_MODE.load(Ordering::Relaxed),
         orphan_blocks: std::collections::HashMap::new(),
         side_forks: std::collections::HashMap::new(),
         reorg_disconnected: Vec::new(),
     };
 
-    // Replay any blocks stored after the snapshot height. These are local
-    // records written by this node (the live list was damaged, not the
-    // blocks), so they replay through the recovered path: the cheap
-    // height/prev linkage check plus the full state transition with page
-    // roots. Re-running complete network validation (including RandomX
-    // proofs and checkpoint logic aimed at untrusted peers) would add
-    // startup cost without adding security on top of the trust already
-    // placed in local records, exactly as the journal replay does.
-    if let Ok(all_blocks) = storage::load_blocks() {
-        for b in all_blocks {
-            if b.height > snap_height {
-                let _ = chain.apply_recovered(b);
-            }
+    // Replay any blocks stored after the snapshot height through the
+    // ordinary apply path in height order; a record the chain refuses
+    // ends the replay, since every record above it presumes it. Every
+    // applied block also advances the version-bit table from the
+    // snapshot's seed, making the retained window a pure function of the
+    // on-disk data.
+    let stored: Vec<chain::Block> = std::fs::read(crate::storage::data_path("chain_blocks.bin"))
+        .ok()
+        .and_then(|bytes| bincode::deserialize(&bytes).ok())
+        .unwrap_or_default();
+    for b in stored.into_iter().filter(|b| b.height > snap_height) {
+        if chain.apply(b).is_err() {
+            break;
         }
     }
-    // Restore the governance metadata saved alongside the blocks so that
-    // checkpoints and soft-fork gates survive the recovery path as well, and
-    // enforce that the data belongs to the replay domain of this node. The
-    // identifier is cloned into the chain above so the enforcement check can
-    // still borrow it here. The deployment table is structurally validated
-    // before it drives the signal-count shifts of the replayed chain.
+
+    // Backfill governance only when the snapshot carried none; the
+    // persisted metadata is validated before it drives consensus.
     if let Ok(meta) = storage::load_chain_meta_full() {
         enforce_chain_id(&meta.chain_id, &active);
         enforce_deployment_table(&meta.deployments);
-        chain.checkpoints = meta.checkpoints;
-        chain.version_bits.deployments = meta.deployments;
+        if chain.version_bits.deployments.is_empty() {
+            chain.checkpoints = meta.checkpoints;
+            chain.version_bits.deployments = meta.deployments;
+        }
     }
+    restore_history(&mut chain);
     recover(chain)
 }
 
-/// Drop every block below the retained window, advancing the base
-/// height so absolute heights stay continuous. State, checkpoints, and
-/// deployment tables are untouched: pruning only forgets block bodies
-/// older than the retention window, and header access below the base
-/// reports None from that point on.
+/// Reduce the stored block list to the pruned retention window, dropping
+/// the oldest blocks and advancing the base height by the same amount,
+/// in place: the caller keeps ownership of the same chain value.
 pub fn prune(chain: &mut chain::Chain) {
-    const PRUNED_RETAIN_BLOCKS: usize = 10_000;
-    while chain.blocks.len() > PRUNED_RETAIN_BLOCKS {
-        chain.blocks.remove(0);
-        chain.base_height += 1;
+    if chain.blocks.len() as u64 > crate::p2p::PRUNED_KEEP_BLOCKS {
+        let excess = (chain.blocks.len() as u64).saturating_sub(crate::p2p::PRUNED_KEEP_BLOCKS);
+        chain.blocks.drain(..excess as usize);
+        chain.base_height = chain.base_height.saturating_add(excess);
     }
 }
 
@@ -243,36 +282,48 @@ pub fn prune(chain: &mut chain::Chain) {
 mod tests {
     use super::*;
 
-    /// The built-in deployment table of a fresh chain: the live schedule
-    /// every loader path is checked against.
+    /// The built-in deployment table, used as the baseline the
+    /// enforcement tests mutate.
     fn built_in_table() -> Vec<chain::Deployment> {
-        chain::Chain::genesis().version_bits.deployments
+        chain::VersionBits::default().deployments
     }
 
     #[test]
-    fn deployment_table_enforcement_accepts_built_ins() {
-        // The built-in table drives the live activation schedule and must
-        // pass the load-time gate unchanged.
-        enforce_deployment_table(&built_in_table());
+    fn enforce_chain_id_panics_on_mismatch() {
+        let result = std::panic::catch_unwind(|| {
+            enforce_chain_id(b"/slash/other", chain::MAINNET_ID.as_bytes());
+        });
+        assert!(result.is_err());
     }
 
     #[test]
-    fn deployment_table_enforcement_rejects_out_of_range_bits() {
-        // A deployment whose bit position leaves the 32-bit version field
-        // would overflow the signal-count shift; the load gate refuses
-        // the table instead of driving consensus with it.
+    fn enforce_chain_id_accepts_empty_persisted() {
+        enforce_chain_id(b"", chain::MAINNET_ID.as_bytes());
+    }
+
+    #[test]
+    fn enforce_chain_id_accepts_matching() {
+        enforce_chain_id(chain::MAINNET_ID.as_bytes(), chain::MAINNET_ID.as_bytes());
+    }
+
+    #[test]
+    fn deployment_table_enforcement_rejects_bad_bit() {
         let mut table = built_in_table();
         table[0].bit = 32;
-        assert!(std::panic::catch_unwind(|| enforce_deployment_table(&table)).is_err());
+        let result = std::panic::catch_unwind(|| enforce_deployment_table(&table));
+        assert!(result.is_err());
     }
 
     #[test]
-    fn deployment_table_enforcement_rejects_impossible_thresholds() {
-        // A threshold beyond the retarget window can never reach the
-        // required signal count inside one window; the load gate refuses
-        // the table.
+    fn deployment_table_enforcement_rejects_bad_threshold() {
         let mut table = built_in_table();
-        table[0].threshold = (chain::DIFFICULTY_ADJUSTMENT_INTERVAL + 1) as _;
-        assert!(std::panic::catch_unwind(|| enforce_deployment_table(&table)).is_err());
+        table[0].threshold = chain::DIFFICULTY_ADJUSTMENT_INTERVAL as u32 + 1;
+        let result = std::panic::catch_unwind(|| enforce_deployment_table(&table));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn deployment_table_enforcement_accepts_built_in() {
+        enforce_deployment_table(&built_in_table());
     }
 }

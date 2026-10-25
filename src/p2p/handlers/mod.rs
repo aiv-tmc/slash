@@ -156,7 +156,18 @@ impl Node {
                     GossipVerdict::Ignore
                 } else {
                     match bincode::deserialize::<crate::chain::Block>(&message.data) {
-                        Ok(block) => self.handle_block(source, block).await,
+                        Ok(block) => {
+                            let (verdict, parked) = self.handle_block(source, block).await;
+                            // The block parked `parked` bytes of retention
+                            // memory on this peer's behalf: charge the
+                            // sender's block bucket for the parked bytes
+                            // so that flooding the retention pools
+                            // starves the flooder's own gossip budget.
+                            if parked > 0 {
+                                buckets.charge_block_bytes(parked);
+                            }
+                            verdict
+                        }
                         Err(_) => GossipVerdict::Reject,
                     }
                 }

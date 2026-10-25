@@ -31,7 +31,6 @@ pub mod simulation;
 pub mod state;
 pub mod storage;
 pub mod treasury;
-pub mod vrf;
 
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_fixtures;
@@ -67,12 +66,15 @@ static PENDING_TXS: OnceLock<Mutex<Vec<chain::Tx>>> = OnceLock::new();
 /// Build the cache key for the in-memory chain cache. The key is the
 /// manifest's content identity — file length plus a short content digest —
 /// so any on-disk change invalidates the cached chain without an mtime
-/// race. Returns `None` when no manifest exists yet.
+/// race. The manifest path is resolved against the library data
+/// directory, so a node anchored with `slash_init` keys its cache on the
+/// manifest inside its own base. Returns `None` when no manifest exists
+/// yet.
 fn manifest_key() -> Option<(String, u64)> {
-    let path = std::path::Path::new("manifest.bin");
-    let md = std::fs::metadata(path).ok()?;
+    let path = crate::storage::data_path("manifest.bin");
+    let md = std::fs::metadata(&path).ok()?;
     let len = md.len();
-    let content = std::fs::read(path).ok()?;
+    let content = std::fs::read(&path).ok()?;
     let digest = blake3::hash(&content);
     let mut key = String::with_capacity(16);
     for b in digest.as_bytes()[..8].iter() {

@@ -10,6 +10,7 @@ fn merkle_root_and_proof() {
     // three-range page.
     let mut page = Page {
         ranges: BTreeMap::new(),
+        ..Default::default()
     };
     page.ranges.insert(
         0,
@@ -53,6 +54,7 @@ fn merkle_root_of_empty_page_fails_loudly() {
     // implicit page-id fallback would create).
     let page = Page {
         ranges: BTreeMap::new(),
+        ..Default::default()
     };
     let _ = page.merkle_root();
 }
@@ -68,6 +70,7 @@ fn merkle_proof_uses_actual_range_ends() {
     assert!(final_len < PAGE_SIZE);
     let mut page = Page {
         ranges: BTreeMap::new(),
+        ..Default::default()
     };
     page.ranges.insert(
         0,
