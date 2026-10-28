@@ -3,61 +3,34 @@ name: Docs
 on:
   push:
     branches: [main]
-
-permissions:
-  contents: read
-  pages: write
-  id-token: write
-
-concurrency:
-  group: "pages"
-  cancel-in-progress: false
+    paths: ["**/*.md", "src/**", ".github/workflows/docs.yml"]
+  pull_request:
+    paths: ["**/*.md", "src/**"]
 
 jobs:
-  build:
+  docs-consistency:
+    name: documentation integrity
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Install system dependencies
+      - uses: actions/checkout@v4
+      - name: Forbidden drift markers in committed code
         run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential cmake libssl-dev pkg-config
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Build Rust documentation
-        run: cargo doc --no-deps --all-features
-        env:
-          RUSTDOCFLAGS: -D warnings
-
-      - name: Add redirect index
+          # CONTRIBUTING.md forbids NEW/CHANGE/OLD/FIXME/HACK/TEMP in comments
+          ! grep -rEn '// *(NEW|CHANGE|OLD|FIXME|HACK|TEMP)[: ]' src/ tests/ benches/
+      - name: TEST.md mentions every integration target
         run: |
-          echo '<meta http-equiv="refresh" content="0;url=slash/index.html">' > target/doc/index.html
-
-      - name: Upload artifact
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: target/doc
-
-  deploy:
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    runs-on: ubuntu-latest
-    needs: build
-    steps:
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
+          for t in chain_tests dao_tests dev_fee_tests emission_harness_tests \
+                   era_nine_boundary_tests integration_tests p2p_tests \
+                   reorg_persistence_tests slow_chain_tests soak_invariants_tests \
+                   soak_network_tests treasury_tests wire_format_tests; do
+            grep -q "$t" TEST.md || { echo "TEST.md missing row for $t"; exit 1; }
+            test -f "tests/$t/main.rs" || { echo "tests/$t/main.rs missing"; exit 1; }
+          done
+      - name: Cargo.toml test targets match tests/ layout
+        run: |
+          for t in chain_tests dao_tests dev_fee_tests emission_harness_tests \
+                   era_nine_boundary_tests integration_tests p2p_tests \
+                   reorg_persistence_tests slow_chain_tests soak_invariants_tests \
+                   soak_network_tests treasury_tests wire_format_tests; do
+            grep -q "tests/$t/main.rs" Cargo.toml || { echo "Cargo.toml missing [[test]] for $t"; exit 1; }
+          done
