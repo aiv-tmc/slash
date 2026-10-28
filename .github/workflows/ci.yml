@@ -20,7 +20,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.87.0
+      - uses: dtolnay/rust-toolchain@1.120.0
         with:
           components: rustfmt
       - run: cargo fmt --all -- --check
@@ -30,7 +30,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.87.0
+      - uses: dtolnay/rust-toolchain@1.120.0
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
@@ -47,7 +47,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.87.0
+      - uses: dtolnay/rust-toolchain@1.120.0
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: slash-doc
@@ -64,7 +64,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.87.0
+      - uses: dtolnay/rust-toolchain@1.120.0
       - name: Lockfile exists
         run: test -f Cargo.lock
       - name: Lockfile is fresh
@@ -77,7 +77,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.87.0
+      - uses: dtolnay/rust-toolchain@1.120.0
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: slash-test
@@ -92,7 +92,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.87.0
+      - uses: dtolnay/rust-toolchain@1.120.0
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: slash-test
@@ -126,7 +126,7 @@ jobs:
     timeout-minutes: ${{ matrix.timeout }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.87.0
+      - uses: dtolnay/rust-toolchain@1.120.0
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: slash-test
@@ -144,7 +144,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.87.0
+      - uses: dtolnay/rust-toolchain@1.120.0
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: slash-bench
@@ -160,7 +160,7 @@ jobs:
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.87.0
+      - uses: dtolnay/rust-toolchain@1.120.0
         with:
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
@@ -185,7 +185,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.87.0
+      - uses: dtolnay/rust-toolchain@1.120.0
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: slash-audit
