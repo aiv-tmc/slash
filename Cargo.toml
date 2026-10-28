@@ -69,7 +69,7 @@ codegen-units = 1
 # Benchmark-only crates stay out of the release dependency graph so that
 # production builds do not compile the Criterion harness.
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 # Self-referential dev-dependency with the test-utils feature. It unifies
 # the feature across the build graph for every test and bench target, so
 # `slash::test_fixtures` resolves in integration tests and benches without
