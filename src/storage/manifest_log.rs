@@ -57,7 +57,10 @@ pub(crate) fn append_blocks_log(blocks: &[crate::chain::Block]) -> anyhow::Resul
     }
     file.sync_all()?;
     let first = blocks.first().map(|b| b.height).unwrap_or(0);
-    atomic_write(BLOCKS_META_PATH, &bincode::serialize(&(first, blocks.len()))?)?;
+    atomic_write(
+        BLOCKS_META_PATH,
+        &bincode::serialize(&(first, blocks.len()))?,
+    )?;
     Ok(())
 }
 

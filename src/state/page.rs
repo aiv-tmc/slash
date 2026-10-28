@@ -14,13 +14,13 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-#[path = "page_tree.rs"]
-mod tree_impl;
 #[path = "page_proof.rs"]
 mod proof_impl;
+#[path = "page_tree.rs"]
+mod tree_impl;
 
-pub(crate) use tree_impl::PageTree;
 pub use proof_impl::{verify_page_proof, PageProof};
+pub(crate) use tree_impl::PageTree;
 
 /// One range inside a page map: the exclusive end offset and the owner.
 /// The start offset is the map key, so the map is always dense and

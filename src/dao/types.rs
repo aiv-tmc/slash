@@ -198,6 +198,35 @@ pub const DAO_MAX_PROPOSALS: usize = 64;
 /// governance pass iterates then stays bounded for the node's whole life.
 pub const DAO_TERMINAL_RETENTION: u64 = DAO_VOTING_PERIOD + DAO_EXEC_DELAY;
 
+/// The furthest an emergency pause may reach past the height at which its
+/// proposal is submitted. A pause is a circuit breaker, not a permanent
+/// policy: an unbounded horizon could freeze an operation class beyond the
+/// reach of any future quorum and deadlock the affected surface, so the
+/// bound keeps every freeze inside a horizon governance can still
+/// revisit. A class that needs longer protection can be re-paused by a
+/// fresh proposal once the current one nears expiry.
+pub const DAO_MAX_PAUSE_BLOCKS: u64 = 4 * DAO_VOTING_PERIOD;
+
+/// The emergency lifeline predicate: a transaction carrying an
+/// `EmergencyResume` submission is the single class admitted while the
+/// broad user-transaction freeze is live. The freeze exists to stop an
+/// exploit class, and only governance lifts it; a freeze that blocked its
+/// own lifting mechanism would be a deadlock by construction, so the
+/// lifeline is carved out of the freeze in every validation path with the
+/// identical predicate — mempool admission and block execution apply the
+/// same exception to the same bytes. Defined beside the governance types
+/// it parses so no two validation paths can drift apart on which memo
+/// qualifies.
+pub(crate) fn is_emergency_lifeline(memo: &Option<Vec<u8>>) -> bool {
+    matches!(
+        memo.as_ref()
+            .and_then(|bytes| bincode::deserialize::<DaoOp>(bytes).ok()),
+        Some(DaoOp::SubmitProposal {
+            payload: DaoPayload::EmergencyResume,
+        })
+    )
+}
+
 #[cfg(test)]
 mod provenance_tests {
     use super::MintProvenance;

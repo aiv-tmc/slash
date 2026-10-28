@@ -24,6 +24,20 @@ struct Cli {
     #[arg(long, default_value_t = 9944)]
     rpc_port: u16,
 
+    /// Accept JSON-RPC connections on every interface instead of
+    /// loopback only. The control methods (stop, mine) additionally
+    /// require --rpc-token when this is set: an unauthenticated control
+    /// socket on a public interface is a remote shutdown vector.
+    #[arg(long)]
+    rpc_external: bool,
+
+    /// Token authorizing the JSON-RPC control methods (stop, mine)
+    /// when the port accepts non-loopback connections. Mandatory with
+    /// --rpc-external; ignored on the loopback default, where the
+    /// socket itself is the trust boundary.
+    #[arg(long)]
+    rpc_token: Option<String>,
+
     /// Keep only the most recent retained window of blocks after
     /// loading, advancing the base height accordingly.
     #[arg(long)]
@@ -83,12 +97,19 @@ async fn main() -> anyhow::Result<()> {
     let node = Node::new(args.port, chain, cmd_rx, miner_key).await?;
 
     // Spawn the JSON-RPC server in a background task with node control
-    // installed: the stop and mine methods forward to the event loop
-    // through the channel clone.
+    // installed. The stop and mine methods forward to the event loop
+    // through the channel clone, and the exposure policy comes from the
+    // CLI: loopback by default, external only with a control token.
     let rpc_addr = args.rpc_port;
     let rpc_cmd = cmd_tx.clone();
+    let rpc_external = args.rpc_external;
+    let rpc_token = args.rpc_token.clone();
     tokio::spawn(async move {
-        let _ = rpc::serve_with(rpc_addr, Some(rpc_cmd)).await;
+        if let Err(e) =
+            rpc::serve_with_config(rpc_addr, Some(rpc_cmd), rpc_external, rpc_token).await
+        {
+            eprintln!("rpc server exited: {e}");
+        }
     });
 
     node.run().await?;

@@ -43,12 +43,44 @@ async fn dispatch_routes_results_and_unknown_methods() {
 #[tokio::test]
 async fn control_methods_report_unconfigured_channel() {
     // Without an installed command channel the control methods answer
-    // with a plain internal error, never with a false success.
+    // with a plain internal error, never with a false success. The
+    // loopback default carries no token, so authorization passes and the
+    // refusal comes from the missing channel.
     let shared = RpcShared::new(None);
     let params = serde_json::from_str("[]").unwrap();
     match dispatch(&shared, "stop", &params).await {
         Err(err) => assert_eq!(err.code, -32603),
         Ok(_) => panic!("stop without a channel must fail closed"),
+    }
+}
+
+#[tokio::test]
+async fn control_methods_require_the_token_on_external_config() {
+    // With a control token installed, an unauthenticated call is
+    // refused with the dedicated authorization code before it reaches
+    // the command channel, and the matching token passes authorization
+    // (the refusal then comes from the unconfigured channel, proving the
+    // call crossed the gate).
+    let shared = RpcShared::new(None).with_control_token(Some("sekrit".to_string()));
+    let params = serde_json::from_str("[]").unwrap();
+    match dispatch(&shared, "stop", &params).await {
+        Err(err) => assert_eq!(err.code, -32001),
+        Ok(_) => panic!("stop without the token must be refused"),
+    }
+    let wrong = serde_json::from_str(r#"[{"token":"wrong"}]"#).unwrap();
+    match dispatch(&shared, "mine", &wrong).await {
+        Err(err) => assert_eq!(err.code, -32001),
+        Ok(_) => panic!("a wrong token must be refused"),
+    }
+    let right = serde_json::from_str(r#"[{"token":"sekrit"}]"#).unwrap();
+    match dispatch(&shared, "stop", &right).await {
+        Err(err) => assert_eq!(err.code, -32603),
+        Ok(_) => panic!("authorized control without a channel still fails closed"),
+    }
+    let bare = serde_json::from_str(r#"["sekrit"]"#).unwrap();
+    match dispatch(&shared, "stop", &bare).await {
+        Err(err) => assert_eq!(err.code, -32603),
+        Ok(_) => panic!("the bare-string token form must authorize"),
     }
 }
 

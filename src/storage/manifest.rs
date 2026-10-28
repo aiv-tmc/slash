@@ -8,9 +8,11 @@
 //! The append-only block log — framing, appending, reading — lives in
 //! the `block_log` child module; this file keeps the snapshot format,
 //! the stamps, the save/load orchestration, and the legacy-layout
-//! compatibility shims.
+//! compatibility shims. Every load-stage error carries the failing
+//! component's name, so a silent fallback in the caller names the
+//! broken half instead of leaving the operator guessing.
 
-use super::{save as save_state, ChainMeta, FileStamp, Header, Manifest};
+use super::{save as save_state, ChainMeta, FileStamp, Manifest};
 use std::collections::BTreeMap;
 
 #[path = "manifest_log.rs"]
@@ -75,7 +77,7 @@ pub fn save_manifest(
     deployments: &[crate::chain::Deployment],
     chain_id: &[u8],
 ) -> anyhow::Result<()> {
-    // The state half: pages + header.
+    // The state half: pages (append-only log) + header.
     save_state(state)?;
 
     // Persist the block list as an append-only log: only the new tail.
@@ -105,61 +107,43 @@ pub fn save_manifest(
     Ok(())
 }
 
-/// The pre-manifest fallback: legacy fixed filenames, no verification.
-fn legacy_triple() -> anyhow::Result<(Vec<crate::chain::Block>, crate::state::State, ChainMeta)> {
-    Ok((
-        load_blocks()?,
-        super::state::load()?,
-        load_chain_meta_full()?,
-    ))
-}
-
 /// Load the full chain record from disk. A manifest that parses is
 /// authoritative: every referenced file is verified against its stamp
 /// before deserialization. A manifest that does not parse falls back to
-/// the legacy fixed filenames without verification.
+/// the legacy fixed filenames without verification. Every stage failure
+/// names its component in the error, so the caller's diagnostic output
+/// identifies the broken half of the triple.
 pub fn load_from_manifest_full(
 ) -> anyhow::Result<(Vec<crate::chain::Block>, crate::state::State, ChainMeta)> {
-    let Ok(bytes) = std::fs::read(super::data_path(MANIFEST_PATH)) else {
-        return legacy_triple();
+    use anyhow::Context;
+    let manifest_bytes = match std::fs::read(super::data_path(MANIFEST_PATH)) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            anyhow::bail!("manifest.bin unreadable: {err}");
+        }
     };
-    let Ok(manifest) = bincode::deserialize::<Manifest>(&bytes) else {
-        return legacy_triple();
-    };
+    let manifest: Manifest = bincode::deserialize(&manifest_bytes)
+        .context("manifest.bin does not deserialize as a Manifest")?;
 
-    let blocks_bytes = verify_stamp(&manifest.blocks_path, &manifest.blocks_stamp)?;
-    let blocks = decode_blocks_log(&blocks_bytes, read_blocks_meta().map(|(_, c)| c as usize))?;
+    let blocks_bytes = verify_stamp(&manifest.blocks_path, &manifest.blocks_stamp)
+        .context("block log stamp verification")?;
+    let blocks = decode_blocks_log(&blocks_bytes, read_blocks_meta().map(|(_, c)| c as usize))
+        .context("block log framing")?;
 
-    let header_bytes = verify_stamp(&manifest.state_header_path, &manifest.state_stamp)?;
-    let header: Header = bincode::deserialize(&header_bytes)?;
+    verify_stamp(&manifest.state_header_path, &manifest.state_stamp)
+        .context("state header stamp verification")?;
+    // Page reconstruction delegates to the single state-load path, which
+    // reads the append-only page log and its seek index — the layout
+    // `save` writes — and falls back to the legacy per-page directory
+    // for snapshots written before the log existed. Reconstructing pages
+    // inline here would re-implement that logic and drift from it, which
+    // is exactly how this path once lost the ability to load the log
+    // layout at all.
+    let state = super::state::load().context("state reconstruction")?;
 
-    let mut pages = BTreeMap::new();
-    for page_id in &header.page_ids {
-        let path = format!("pages/{:04x}.bin", page_id);
-        let bytes = std::fs::read(super::data_path(&path))?;
-        let page: crate::state::Page = bincode::deserialize(&bytes)?;
-        pages.insert(*page_id, page);
-    }
-
-    let state = crate::state::State {
-        pages,
-        locks: header.locks,
-        lock_created: header.lock_created,
-        balance_cache: header.balance_cache,
-        treasury_signer: header.treasury_signer,
-        total_sold: header.total_sold,
-        total_bought_back: header.total_bought_back,
-        dev_fund_signer: header.dev_fund_signer,
-        dev_fee_bps: header.dev_fee_bps,
-        mine_fee_bps: header.mine_fee_bps,
-        dao: header.dao,
-        emergency_flags: header.emergency_flags,
-        emergency_until: header.emergency_until,
-        touched_pages: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
-    };
-
-    let meta_bytes = verify_stamp(&manifest.chain_meta_path, &manifest.meta_stamp)?;
-    let meta: ChainMeta = bincode::deserialize(&meta_bytes)?;
+    let meta_bytes = verify_stamp(&manifest.chain_meta_path, &manifest.meta_stamp)
+        .context("chain meta stamp verification")?;
+    let meta: ChainMeta = bincode::deserialize(&meta_bytes).context("chain meta decode")?;
 
     Ok((blocks, state, meta))
 }

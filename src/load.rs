@@ -3,6 +3,11 @@
 //! rebuild. Every entry point funnels into [`load_pruned`], which never
 //! operates on fabricated history: when no exact anchor exists for the
 //! reorg window the history stays empty and reorgs fail closed.
+//!
+//! Diagnostics: every load-stage refusal is printed with its reason
+//! before the fallback engages, so a startup that lands on snapshot
+//! recovery names the broken component instead of leaving the operator
+//! guessing which half of the triple failed.
 
 use crate::{active_chain_id, chain, state, storage};
 use std::sync::atomic::Ordering;
@@ -13,6 +18,13 @@ use std::sync::atomic::Ordering;
 /// instead of wedging block by block.
 #[path = "load_sanity.rs"]
 mod sanity;
+
+/// The enforcement unit tests live in a sibling file: they exercise the
+/// private gates of this module through the child-module access the path
+/// attribute preserves, keeping this file focused on the recovery path.
+#[cfg(test)]
+#[path = "load_tests.rs"]
+mod tests;
 
 /// Enforce that on-disk chain data belongs to the replay domain the node
 /// was started for: the persisted identifier is authoritative, a mismatch
@@ -100,43 +112,54 @@ fn recover(mut chain: chain::Chain) -> chain::Chain {
     chain
 }
 
-/// Rebuild the state history on a freshly loaded chain; the manifest
-/// persists only the tip state, so the reorg machinery would otherwise
-/// have no historical states to restore. An exact anchor is required —
-/// genesis for a short chain, the snapshot before the first stored block
-/// for a pruned chain, the newest snapshot inside the reorg window for a
-/// long one — and the replay never exceeds HISTORY_REBUILD_MAX_REPLAY;
-/// with no exact anchor the history stays empty and reorgs fail closed.
+/// Rebuild the state and deployment histories on a freshly loaded chain;
+/// the manifest persists only the tip pair, so the reorg machinery would
+/// otherwise have no historical states or rule sets to restore. An exact
+/// anchor pair is required — genesis for a short chain, the snapshot
+/// before the first stored block for a pruned chain, the newest snapshot
+/// inside the reorg window for a long one — and the replay never exceeds
+/// HISTORY_REBUILD_MAX_REPLAY; with no exact anchor both histories stay
+/// empty and reorgs fail closed.
 fn restore_history(chain: &mut chain::Chain) {
     let tip = (chain.blocks.len() as u64)
         .saturating_add(chain.base_height)
         .saturating_sub(1);
-    let anchor = if chain.base_height == 0 && tip <= chain::HISTORY_REBUILD_MAX_REPLAY {
-        // Short full chain: replaying from genesis stays inside the bound.
-        Some((state::State::genesis(), 0u64))
-    } else if chain.base_height > 0 {
-        // The state after block base_height - 1 is the only valid replay
-        // start for the stored window, which never exceeds the bound.
-        let want = chain.base_height - 1;
-        storage::load_latest_snapshot(want)
-            .ok()
-            .filter(|(h, _)| *h == want)
-            .map(|(h, s)| (s, h))
-    } else {
-        // Long full chain: the newest snapshot at or below the reorg
-        // window is the only anchor cheap enough to replay from.
-        storage::load_latest_snapshot(tip.saturating_sub(chain::MAX_REORG_DEPTH))
-            .ok()
-            .map(|(h, s)| (s, h))
-    };
-    if let Some((anchor_state, anchor_height)) = anchor {
-        if chain
-            .rebuild_state_history(anchor_state, anchor_height)
-            .is_err()
+    // The anchor carries the deployment table alongside the state: the
+    // pair replays in lockstep, exactly as `record_history` records it,
+    // so the first reorg after a restart finds both halves of the pair.
+    let anchor: Option<(state::State, Vec<chain::Deployment>, u64)> =
+        if chain.base_height == 0 && tip <= chain::HISTORY_REBUILD_MAX_REPLAY {
+            // Short full chain: replaying from genesis stays inside the
+            // bound, and the genesis-time table is the built-in schedule.
+            Some((
+                state::State::genesis(),
+                chain::VersionBits::new().deployments,
+                0u64,
+            ))
+        } else if chain.base_height > 0 {
+            // The state and the rule set after block base_height - 1 are
+            // the only valid replay start for the stored window.
+            let want = chain.base_height - 1;
+            storage::load_latest_snapshot_record(want)
+                .ok()
+                .filter(|(h, _)| *h == want)
+                .map(|(h, r)| (r.state, r.deployments, h))
+        } else {
+            // Long full chain: the newest snapshot at or below the reorg
+            // window is the only anchor cheap enough to replay from.
+            storage::load_latest_snapshot_record(tip.saturating_sub(chain::MAX_REORG_DEPTH))
+                .ok()
+                .map(|(h, r)| (r.state, r.deployments, h))
+        };
+    if let Some((anchor_state, anchor_deployments, anchor_height)) = anchor {
+        if let Err(reason) =
+            chain.rebuild_state_history(anchor_state, anchor_height, anchor_deployments)
         {
             // Replay failure means corruption; without a trustworthy
-            // history every reorg must be rejected.
+            // pair every reorg must be rejected.
+            eprintln!("[load] state-history rebuild failed: {reason}");
             chain.state_history.clear();
+            chain.deployments_history.clear();
         }
     }
 }
@@ -150,7 +173,14 @@ fn restore_history(chain: &mut chain::Chain) {
 pub fn load_pruned() -> chain::Chain {
     // Manifest load first: the manifest is written last by every
     // consistent save, so its presence certifies the triple.
-    if let Ok((blocks, state, meta)) = storage::load_from_manifest_full() {
+    let manifest_triple = match storage::load_from_manifest_full() {
+        Ok(triple) => Some(triple),
+        Err(err) => {
+            eprintln!("[load] manifest load failed ({err:#}); falling back to snapshot recovery");
+            None
+        }
+    };
+    if let Some((blocks, state, meta)) = manifest_triple {
         let active = active_chain_id();
         enforce_chain_id(&meta.chain_id, &active);
         // The deployment table drives the signal-count shifts and the
@@ -275,55 +305,5 @@ pub fn prune(chain: &mut chain::Chain) {
         let excess = (chain.blocks.len() as u64).saturating_sub(crate::p2p::PRUNED_KEEP_BLOCKS);
         chain.blocks.drain(..excess as usize);
         chain.base_height = chain.base_height.saturating_add(excess);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The built-in deployment table, used as the baseline the
-    /// enforcement tests mutate.
-    fn built_in_table() -> Vec<chain::Deployment> {
-        chain::VersionBits::default().deployments
-    }
-
-    #[test]
-    fn enforce_chain_id_panics_on_mismatch() {
-        let result = std::panic::catch_unwind(|| {
-            enforce_chain_id(b"/slash/other", chain::MAINNET_ID.as_bytes());
-        });
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn enforce_chain_id_accepts_empty_persisted() {
-        enforce_chain_id(b"", chain::MAINNET_ID.as_bytes());
-    }
-
-    #[test]
-    fn enforce_chain_id_accepts_matching() {
-        enforce_chain_id(chain::MAINNET_ID.as_bytes(), chain::MAINNET_ID.as_bytes());
-    }
-
-    #[test]
-    fn deployment_table_enforcement_rejects_bad_bit() {
-        let mut table = built_in_table();
-        table[0].bit = 32;
-        let result = std::panic::catch_unwind(|| enforce_deployment_table(&table));
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn deployment_table_enforcement_rejects_bad_threshold() {
-        let mut table = built_in_table();
-        table[0].threshold = chain::DIFFICULTY_ADJUSTMENT_INTERVAL as u32 + 1;
-        let result = std::panic::catch_unwind(|| enforce_deployment_table(&table));
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn deployment_table_enforcement_accepts_built_in() {
-        enforce_deployment_table(&built_in_table());
     }
 }

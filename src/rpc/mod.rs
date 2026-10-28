@@ -13,12 +13,16 @@
 //! an internal error instead of poisoning the lock for the process
 //! lifetime. The two control methods, `stop` and `mine`, reach the node
 //! through the command channel installed at startup; an endpoint without
-//! a configured channel answers them with a plain internal error.
+//! a configured channel answers them with a plain internal error. The
+//! server binds loopback by default: exposing it beyond loopback requires
+//! a control token, and the control methods refuse every call that does
+//! not present it — an unauthenticated control socket on a public
+//! interface would be a remote shutdown and a remote hashrate trigger.
 //!
 //! Layout:
 //! - `handlers` — the individual JSON-RPC method handlers
 //! - `rpc_tests` (test-only, sibling file) — the envelope, dispatch,
-//!   rate-limit, sweep, and poison-safety tests
+//!   rate-limit, sweep, poison-safety, and control-authorization tests
 
 mod handlers;
 
@@ -29,7 +33,7 @@ use axum::routing::post;
 use axum::{Json, Router};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -53,9 +57,9 @@ const BUCKET_CAPACITY: f64 = 5.0;
 /// The linear refill rate in tokens per second.
 const BUCKET_REFILL_PER_SEC: f64 = 2.0;
 
-/// Shared RPC state: the per-IP rate-limit buckets and the node command
-/// channel. Handlers receive it as axum state, so no global mutable
-/// state backs the HTTP surface.
+/// Shared RPC state: the per-IP rate-limit buckets, the node command
+/// channel, and the control token. Handlers receive it as axum state, so
+/// no global mutable state backs the HTTP surface.
 pub(super) struct RpcShared {
     /// Per-IP token buckets. The map grows by one small entry per new
     /// source address and is swept at the watermark, so its size is
@@ -67,6 +71,10 @@ pub(super) struct RpcShared {
     /// was started without node control (for example an external
     /// fronting server that owns the node).
     pub(super) cmd: Option<tokio::sync::mpsc::Sender<crate::p2p::NodeCommand>>,
+    /// The token external control calls must present. None on a
+    /// loopback bind, where the socket itself is the trust boundary and
+    /// local tooling controls the node without ceremony.
+    control_token: Option<Arc<str>>,
 }
 
 impl RpcShared {
@@ -74,7 +82,15 @@ impl RpcShared {
         Self {
             buckets: Mutex::new(HashMap::new()),
             cmd,
+            control_token: None,
         }
+    }
+
+    /// Install a control token. Consumed by `serve_with_config` when the
+    /// operator exposes the RPC port beyond loopback.
+    fn with_control_token(mut self, token: Option<String>) -> Self {
+        self.control_token = token.map(Arc::from);
+        self
     }
 
     /// Admits one request from `ip`, refilling the bucket linearly since
@@ -108,7 +124,8 @@ impl RpcShared {
 /// A JSON-RPC error: numeric code, message, and optional structured
 /// data. Codes follow the JSON-RPC 2.0 convention: -32700 parse, -32600
 /// invalid request, -32601 method not found, -32602 invalid params,
-/// -32603 internal error.
+/// -32603 internal error; -32001 marks a refused control authorization
+/// and -32003 a rejected transaction.
 #[derive(Debug)]
 pub(super) struct RpcError {
     pub(super) code: i64,
@@ -140,24 +157,82 @@ impl RpcError {
             data: None,
         }
     }
+
+    /// A control method refused a caller that did not present the
+    /// configured token on a socket that accepts non-loopback
+    /// connections. The call never reaches the command channel.
+    fn unauthorized(message: &str) -> Self {
+        Self {
+            code: -32001,
+            message: format!("unauthorized: {message}"),
+            data: None,
+        }
+    }
 }
 
 /// Start the JSON-RPC HTTP server on `port` without node control: the
 /// control methods answer with an internal error on this endpoint.
+/// Binds loopback only.
 pub async fn serve(port: u16) -> std::io::Result<()> {
-    serve_with(port, None).await
+    serve_shared(
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        port,
+        Arc::new(RpcShared::new(None)),
+    )
+    .await
 }
 
 /// Start the JSON-RPC HTTP server on `port` with a node command channel
-/// installed. The control methods forward `stop` and `mine` commands to
-/// the event loop through the sender.
+/// installed, loopback only. Loopback is the safe default for the node
+/// binary: `stop` and `mine` reach the event loop without a token because
+/// only local processes can touch the socket. Exposing the port beyond
+/// loopback requires `serve_with_config` with a control token.
 pub async fn serve_with(
     port: u16,
     cmd: Option<tokio::sync::mpsc::Sender<crate::p2p::NodeCommand>>,
 ) -> std::io::Result<()> {
-    let shared = Arc::new(RpcShared::new(cmd));
+    serve_shared(
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        port,
+        Arc::new(RpcShared::new(cmd)),
+    )
+    .await
+}
+
+/// Start the JSON-RPC HTTP server with an explicit exposure policy.
+/// `external` binds every interface and is refused without a control
+/// token: an unauthenticated control socket on a public interface is a
+/// remote shutdown and a remote hashrate trigger, so the token is
+/// mandatory whenever the socket leaves loopback.
+pub async fn serve_with_config(
+    port: u16,
+    cmd: Option<tokio::sync::mpsc::Sender<crate::p2p::NodeCommand>>,
+    external: bool,
+    token: Option<String>,
+) -> std::io::Result<()> {
+    if external && token.is_none() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "external RPC bind requires --rpc-token for the control methods",
+        ));
+    }
+    let bind = if external {
+        IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+    } else {
+        IpAddr::V4(Ipv4Addr::LOCALHOST)
+    };
+    serve_shared(bind, port, Arc::new(RpcShared::new(cmd).with_control_token(token))).await
+}
+
+/// The shared server bootstrap: one POST route, the listener, and the
+/// connection-info extractor that feeds the per-IP rate limiter.
+async fn serve_shared(
+    bind: IpAddr,
+    port: u16,
+    shared: Arc<RpcShared>,
+) -> std::io::Result<()> {
     let app = Router::new().route("/", post(handle)).with_state(shared);
-    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
+    let listener = tokio::net::TcpListener::bind((bind, port)).await?;
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -213,8 +288,9 @@ async fn handle(
 }
 
 /// Route a JSON-RPC method name to its handler. Every data method lives
-/// in `handlers`; the two control methods forward to the node command
-/// channel installed in the shared state.
+/// in `handlers`; the two control methods pass the authorization gate
+/// first and then forward to the node command channel installed in the
+/// shared state.
 pub(super) async fn dispatch(
     shared: &RpcShared,
     method: &str,
@@ -232,12 +308,42 @@ pub(super) async fn dispatch(
         "getTreasuryState" => handlers::handle_get_treasury_state(params).await,
         "buildTreasuryBuy" => handlers::handle_build_treasury_buy(params).await,
         "buildTreasurySell" => handlers::handle_build_treasury_sell(params).await,
-        "stop" => handlers::handle_stop(shared).await,
-        "mine" => handlers::handle_mine(shared).await,
+        "stop" => {
+            control_authorized(shared, params)?;
+            handlers::handle_stop(shared).await
+        }
+        "mine" => {
+            control_authorized(shared, params)?;
+            handlers::handle_mine(shared).await
+        }
         _ => Err(RpcError {
             code: -32601,
             message: format!("method not found: {method}"),
             data: None,
         }),
+    }
+}
+
+/// Control authorization. On a loopback bind every control call is
+/// local and passes. On an external bind the configured token must be
+/// presented as the first string param or as the `token` string field of
+/// the first object param; a missing or mismatched token refuses the
+/// call with the dedicated authorization error before it reaches the
+/// command channel, so an unauthenticated network peer can neither
+/// shut the node down nor trigger its miner.
+fn control_authorized(shared: &RpcShared, params: &Value) -> Result<(), RpcError> {
+    let Some(expected) = &shared.control_token else {
+        return Ok(());
+    };
+    let presented = params
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|v| v.as_str().or_else(|| v.get("token").and_then(Value::as_str)));
+    if presented == Some(expected.as_ref()) {
+        Ok(())
+    } else {
+        Err(RpcError::unauthorized(
+            "control methods require the configured RPC token",
+        ))
     }
 }

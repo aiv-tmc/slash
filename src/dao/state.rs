@@ -5,8 +5,8 @@
 
 use super::payload::{execute_payload, payload_valid};
 use super::types::{
-    DaoOp, DaoPayload, MintProvenance, Proposal, ProposalStatus, DAO_MAX_PROPOSALS,
-    DAO_TERMINAL_RETENTION, DAO_VOTING_PERIOD,
+    DaoOp, DaoPayload, MintProvenance, Proposal, ProposalStatus, DAO_MAX_PAUSE_BLOCKS,
+    DAO_MAX_PROPOSALS, DAO_TERMINAL_RETENTION, DAO_VOTING_PERIOD,
 };
 use super::weight::{close_outcome, locked_weight, total_locked_weight};
 use serde::{Deserialize, Serialize};
@@ -24,11 +24,12 @@ pub struct DaoState {
     pub proposals: BTreeMap<u64, Proposal>,
     /// Next proposal id to assign.
     pub next_id: u64,
-    /// Provenance of every cell a governance mint ever issued. The curve
-    /// vault funds sell payouts from buyers' payments alone; a mint moved
-    /// these cells out without a payment, so they carry no buy-back
-    /// rights, and the transfer engine refuses any sell of them back to
-    /// the treasury through this single set.
+    /// Provenance of every cell a governance mint ever issued. The bonding curve
+    /// funds sell payouts exclusively from payments buyers made into the
+    /// treasury vault; a governance mint moved these cells out without
+    /// any such payment, so they carry no buy-back rights, and the
+    /// transfer engine refuses any sell of them back to the treasury
+    /// through this single set.
     pub minted: MintProvenance,
 }
 
@@ -55,8 +56,9 @@ impl DaoState {
     /// the proposal opens. `locked_total` is the total locked weight at
     /// the submission height, supplied by the caller; the value rides the
     /// record so closing the proposal later never rescans the ledger.
-    /// Returns None when the open proposal cap is reached or the payload
-    /// is structurally invalid.
+    /// Returns None when the open proposal cap is reached, the payload
+    /// is structurally invalid, or the requested pause reaches past the
+    /// horizon a submission may bind.
     pub fn submit(
         &mut self,
         payload: DaoPayload,
@@ -70,14 +72,28 @@ impl DaoState {
         if !payload_valid(&payload) {
             return None;
         }
+        // The pause horizon is bounded on both sides relative to the
+        // submission height: a freeze that has already expired at
+        // submission is an inert proposal, and one reaching past the
+        // bound could outlive any plausible quorum and deadlock the
+        // frozen classes permanently, while a class that needs longer
+        // protection can be re-paused by a fresh proposal. The bounds
+        // live here rather than in the shape validator because only the
+        // submission knows the height the horizon must be measured from.
+        if let DaoPayload::EmergencyPause { until_height, .. } = &payload {
+            if *until_height <= height || *until_height > height.saturating_add(DAO_MAX_PAUSE_BLOCKS)
+            {
+                return None;
+            }
+        }
         let id = self.next_id;
-        self.next_id += 1;
+        self.next_id = self.next_id.saturating_add(1);
         let proposal = Proposal {
             id,
             payload,
             submitter,
             start_height: height,
-            end_height: height.saturating_add(DAO_VOTING_PERIOD),
+            end_height: height + DAO_VOTING_PERIOD,
             snapshot_height: height,
             locked_total,
             yes_weight: 0,
@@ -273,5 +289,61 @@ impl DaoState {
                 self.vote(*proposal_id, voter, weight, *approve, height)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod submission_tests {
+    use super::*;
+
+    #[test]
+    fn pause_horizon_rejects_binds_past_the_bound() {
+        // A pause reaching past the submission-bound horizon is refused,
+        // and the bound is measured from the submission height: the
+        // same payload that is in bounds at a late height is refused at an
+        // early one, and a payload exactly at the bound is accepted.
+        let mut dao = DaoState::genesis();
+        let far = height_at_bound(100) + 1;
+        let payload = || DaoPayload::EmergencyPause {
+            flags: 0b01,
+            until_height: far,
+        };
+        assert!(dao.submit(payload(), [1u8; 32], 100, 0).is_none());
+        assert!(dao
+            .submit(
+                DaoPayload::EmergencyPause {
+                    flags: 0b01,
+                    until_height: height_at_bound(100),
+                },
+                [1u8; 32],
+                100,
+                0,
+            )
+            .is_some());
+    }
+
+    #[test]
+    fn pause_horizon_scales_with_submission_height() {
+        // The horizon is relative, not absolute: submitting the same
+        // absolute height at a later block is accepted once it falls
+        // inside the bound of that submission.
+        let mut dao = DaoState::genesis();
+        let target = 100 + DAO_MAX_PAUSE_BLOCKS;
+        assert!(dao
+            .submit(
+                DaoPayload::EmergencyPause {
+                    flags: 0b01,
+                    until_height: target,
+                },
+                [1u8; 32],
+                100,
+                0,
+            )
+            .is_some());
+    }
+
+    /// The furthest in-bounds horizon for a submission at `height`.
+    fn height_at_bound(height: u64) -> u64 {
+        height + DAO_MAX_PAUSE_BLOCKS
     }
 }

@@ -72,6 +72,35 @@ struct StagedTransfer {
     staged_locks: Vec<(u64, u64, u64)>,
 }
 
+/// Log one staging refusal when the trace switch is set. The site name is
+/// a stable identifier for tests and operators; consensus never depends on
+/// whether the line prints.
+fn stage_trace(site: &str, from: [u8; 32], inputs: &[(u64, u64)]) {
+    if std::env::var_os("SLASH_TRACE_TX").is_some() {
+        eprintln!(
+            "[txs] stage {site} refused: from {} inputs {:?}",
+            hex::encode(from),
+            inputs
+        );
+    }
+}
+
+/// The first cell of the span that is not owned by `owner`, with its
+/// actual owner: the ownership refusal names the divergence instead of
+/// leaving the operator guessing which half of the map disagrees.
+fn ownership_probe(
+    state: &State,
+    owner: [u8; 32],
+    s: u64,
+    e: u64,
+) -> Option<(u64, Option<[u8; 32]>)> {
+    (s..e).find_map(|c| match state.get(c) {
+        Some((_, _, o)) if o != owner => Some((c, Some(o))),
+        None => Some((c, None)),
+        _ => None,
+    })
+}
+
 impl State {
     /// Execute a signed transaction: every predicate, then commit.
     /// Rejection leaves the state untouched. Under the `SLASH_TRACE_TX`
@@ -152,6 +181,7 @@ impl State {
         // refused here so that no caller of the transfer engine can ever
         // route a lock onto an address no key controls.
         if outputs.iter().any(|o| o.to == TREASURY && o.lock.is_some()) {
+            stage_trace("treasury lock", from, inputs);
             return None;
         }
         let mut overlay: BTreeMap<u16, Page> = BTreeMap::new();
@@ -168,6 +198,16 @@ impl State {
         for &(s, e) in inputs {
             let pid = page_id(s);
             if !self.owns(from, s, e, height) {
+                if std::env::var_os("SLASH_TRACE_TX").is_some() {
+                    let probe = ownership_probe(self, from, s, e);
+                    eprintln!(
+                        "[txs] stage ownership detail: from {} span ({s}, {e}) first_bad_cell={:?} actual_owner={:?}",
+                        hex::encode(from),
+                        probe.map(|(c, _)| c),
+                        probe.and_then(|(_, o)| o)
+                    );
+                }
+                stage_trace("ownership", from, inputs);
                 return None;
             }
             let page = overlay.entry(pid).or_insert_with(|| {
@@ -177,6 +217,7 @@ impl State {
                     .unwrap_or_else(|| pristine_page(pid))
             });
             if !page.remove_range(page_offset(s), page_offset(s) + (e - s)) {
+                stage_trace("range removal", from, inputs);
                 return None;
             }
             *per_page.entry(pid).or_insert(0) -= (e - s) as i128;
@@ -207,6 +248,7 @@ impl State {
         // transaction.
         for delta in per_page.values() {
             if *delta != 0 {
+                stage_trace("per-page balance", from, inputs);
                 return None;
             }
         }
@@ -223,6 +265,7 @@ impl State {
             .count() as u64;
         let new_locked: u64 = staged_locks.iter().map(|(s, e, _)| e - s).sum();
         if live_locks.saturating_add(new_locked) > MAX_LOCKED_CELLS {
+            stage_trace("global lock cap", from, inputs);
             return None;
         }
         Some(StagedTransfer {

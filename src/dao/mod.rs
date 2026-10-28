@@ -16,5 +16,6 @@ mod weight;
 
 pub use payload::{execute_payload, payload_valid};
 pub use state::DaoState;
+pub(crate) use types::is_emergency_lifeline;
 pub use types::*;
 pub use weight::{close_outcome, locked_weight, total_locked_weight};
