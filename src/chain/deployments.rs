@@ -2,7 +2,7 @@
 //! threshold evaluation at window ends, and deferred activation.
 //!
 //! Every deployment tracks a BIP-9-style lifecycle
-//! (Defined → Started → LockedIn → Active, or Failed) driven by the
+//! (Defined -> Started -> LockedIn -> Active, or Failed) driven by the
 //! version bits of the blocks inside each retarget window.
 
 use super::chain::Chain;
@@ -24,11 +24,18 @@ impl Chain {
 impl VersionBits {
     /// Update the deployment table for a newly applied block. A deployment
     /// starts counting signals when the chain reaches its start height,
-    /// counts signals per retarget window, and locks in at the end of any
-    /// window that reaches the required threshold. The active height is
-    /// always one full interval past the window that locked the deployment
-    /// in, so every node observes the lock-in and its scheduled activation
-    /// before the rules change.
+    /// counts signals per retarget window, and locks in when the block
+    /// that closes a window carries the window's tally to the threshold.
+    /// The active height is always one full interval past the window that
+    /// locked the deployment in, so every node observes the lock-in and
+    /// its scheduled activation before the rules change.
+    ///
+    /// The two window boundaries are kept distinct on purpose: the tally
+    /// is evaluated at the block that closes a window, and the counter is
+    /// cleared at the block that opens the next one. Every block of a
+    /// window therefore contributes to exactly one tally: the closing
+    /// block belongs to the window it closes, and the opening block
+    /// starts the fresh window with a clean counter.
     pub(crate) fn update(&mut self, block: &Block) {
         let height = block.height;
         for d in &mut self.deployments {
@@ -74,19 +81,34 @@ impl VersionBits {
                 DeploymentStatus::Defined => {
                     // The block that opens the signaling period belongs to
                     // the first window and counts toward that window's
-                    // threshold.
+                    // threshold. The counter starts fresh here because the
+                    // deployment has no tally from before its start height.
                     d.status = DeploymentStatus::Started;
                     d.signals = u32::from(signaling);
                 }
                 DeploymentStatus::Started => {
-                    d.signals = d.signals.saturating_add(u32::from(signaling));
+                    // A block on a window boundary opens a new window: the
+                    // previous window's tally has already been evaluated by
+                    // its closing block, so the counter resets before this
+                    // block's own signal is accumulated. Resetting before
+                    // the accumulation keeps the opening block's signal in
+                    // the new window; resetting after would discard it.
                     if height.is_multiple_of(DIFFICULTY_ADJUSTMENT_INTERVAL) {
-                        if d.signals >= d.threshold {
-                            d.status = DeploymentStatus::LockedIn;
-                            d.activation_height =
-                                Some(height.saturating_add(DIFFICULTY_ADJUSTMENT_INTERVAL));
-                        }
                         d.signals = 0;
+                    }
+                    d.signals = d.signals.saturating_add(u32::from(signaling));
+                    // A block whose successor opens a new window closes the
+                    // current one: the tally now holds exactly the signals
+                    // of one full window, and the threshold test runs on
+                    // that complete window. The counter intentionally
+                    // survives the evaluation until the next window opens,
+                    // so observers can read the closing tally.
+                    if (height + 1).is_multiple_of(DIFFICULTY_ADJUSTMENT_INTERVAL)
+                        && d.signals >= d.threshold
+                    {
+                        d.status = DeploymentStatus::LockedIn;
+                        d.activation_height =
+                            Some(height.saturating_add(DIFFICULTY_ADJUSTMENT_INTERVAL));
                     }
                 }
                 // LockedIn is handled by the activation guard above and

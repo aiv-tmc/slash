@@ -11,6 +11,13 @@ impl super::chain::Chain {
     /// The rescale compares the measured window time against the target
     /// interval time and clamps the result to a four-fold change per
     /// interval, never below the minimum difficulty of one.
+    ///
+    /// The measured window is the interval that just ended: the
+    /// DIFFICULTY_ADJUSTMENT_INTERVAL blocks before `height`. The block
+    /// vector holds every height above `base_height`, so the window ends
+    /// at the last retained block and begins one interval earlier; the
+    /// boundary guard reflects that the window reads indices up to
+    /// `idx - 2`, where `idx = height - base_height`.
     pub fn difficulty_for_height(&self, height: u64) -> u64 {
         let base = self.base_height.max(1);
         if height <= base || self.blocks.is_empty() {
@@ -18,30 +25,31 @@ impl super::chain::Chain {
         }
         let idx = height.saturating_sub(self.base_height) as usize;
         if (height - 1).is_multiple_of(DIFFICULTY_ADJUSTMENT_INTERVAL)
-            && idx > 0
-            && idx <= self.blocks.len()
+            && idx > 1
+            && idx - 1 <= self.blocks.len()
         {
             // Measure over the window that ends at the block before
-            // `height`: up to DIFFICULTY_ADJUSTMENT_INTERVAL blocks.
-            let window_end = idx;
+            // `height`: the DIFFICULTY_ADJUSTMENT_INTERVAL blocks of the
+            // interval that just closed.
+            let window_end = idx - 1;
             let start_idx = window_end.saturating_sub(DIFFICULTY_ADJUSTMENT_INTERVAL as usize);
             let start_time = self.blocks[start_idx].time;
             let end_time = self.blocks[window_end - 1].time;
-            let actual = end_time.saturating_sub(start_time).max(1);
-            let target = DIFFICULTY_ADJUSTMENT_INTERVAL * TARGET_BLOCK_TIME_SECS;
             let last_diff = self.blocks[window_end - 1].difficulty;
-            let mut new_diff = (last_diff as u128)
-                .saturating_mul(target as u128)
-                .saturating_div(actual as u128) as u64;
-            let max_diff = last_diff.saturating_mul(4);
-            let min_diff = last_diff.saturating_div(4).max(1);
-            if new_diff > max_diff {
-                new_diff = max_diff;
-            }
-            if new_diff < min_diff {
-                new_diff = min_diff;
-            }
-            return new_diff;
+            let actual = end_time.saturating_sub(start_time).max(1) as u128;
+            let target = (DIFFICULTY_ADJUSTMENT_INTERVAL * TARGET_BLOCK_TIME_SECS) as u128;
+            let raw = (last_diff as u128).saturating_mul(target).saturating_div(actual);
+            // The clamps run in u128: on a pathological window the raw
+            // rescale can exceed u64 range, and a truncating cast would
+            // wrap the value before the clamp could act on it. Clamping
+            // in the wider type, capping at u64::MAX, and casting once
+            // keeps every window inside [last/4, last*4] with the
+            // floor of one.
+            let max_difficulty = (last_diff as u128).saturating_mul(4);
+            let min_difficulty = ((last_diff as u128) / 4).max(1);
+            return raw
+                .clamp(min_difficulty, max_difficulty)
+                .min(u64::MAX as u128) as u64;
         }
         if let Some(b) = self.blocks[..idx.min(self.blocks.len())].iter().next_back() {
             return b.difficulty;

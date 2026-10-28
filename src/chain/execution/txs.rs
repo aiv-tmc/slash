@@ -11,8 +11,8 @@ use crate::state;
 /// Emit a rejection trace line when the `SLASH_TRACE_TX` environment
 /// variable is set. The switch is read once per block execution; the
 /// facility costs nothing when disabled and names the exact refusal site
-/// — freeze gate, user transaction engine, or treasury pairing — with the
-/// fields that decided it, so a failing template or fixture can be
+/// — freeze gate, user transaction engine, or treasury pairing — with
+/// the fields that decided it, so a failing template or fixture can be
 /// diagnosed from a single test run instead of bisecting consensus code.
 fn trace_rejection(switch: bool, site: &str, detail: String) {
     if switch {
@@ -33,19 +33,12 @@ fn parse_governance_op(memo: &Option<Vec<u8>>) -> Option<crate::dao::DaoOp> {
 
 /// The emergency lifeline predicate: a transaction carrying an
 /// `EmergencyResume` submission is the single class admitted while the
-/// broad user-transaction freeze is live. The freeze exists to stop an
-/// exploit class, and only governance lifts it; a freeze that blocked its
-/// own lifting mechanism would be a deadlock by construction, so the
-/// lifeline is carved out of the freeze in both validation paths with the
-/// identical predicate — mempool admission and block execution apply the
-/// same exception to the same bytes.
+/// broad user-transaction freeze is live. The predicate delegates to the
+/// canonical implementation beside the governance types, so the mempool
+/// admission path and this execution path decide lifeleness on the same
+/// bytes by construction and can never drift apart.
 fn is_emergency_lifeline(memo: &Option<Vec<u8>>) -> bool {
-    matches!(
-        parse_governance_op(memo),
-        Some(crate::dao::DaoOp::SubmitProposal {
-            payload: crate::dao::DaoPayload::EmergencyResume,
-        })
-    )
+    crate::dao::is_emergency_lifeline(memo)
 }
 
 impl Chain {
@@ -103,6 +96,23 @@ impl Chain {
                         tx.memo.as_ref().map(|m| m.len()),
                         is_emergency_lifeline(&tx.memo)
                     ),
+                );
+                return Err(BlockError::InvalidTx);
+            }
+            // Structural amplification caps, identical to the mempool
+            // admission gate: the range and page caps bound the staging
+            // footprint before any page materialization happens, and the
+            // field caps refuse oversized signatures and memos before
+            // any hashing or verification work. A miner must not bypass
+            // the caps mempool admission enforces by including in a
+            // block what admission would refuse, so block execution
+            // applies the same shape checks to every transaction before
+            // the engine or the pairing tables touch it.
+            if !self.tx_structure_valid(tx) {
+                trace_rejection(
+                    trace,
+                    "structure caps",
+                    format!("index {i} from {}", hex::encode(tx.from)),
                 );
                 return Err(BlockError::InvalidTx);
             }
@@ -273,8 +283,7 @@ impl Chain {
                     // moved out through a temporary genesis value so
                     // the two mutable borrows stay disjoint, and are
                     // moved back immediately after the call.
-                    let mut dao =
-                        std::mem::replace(&mut temp.dao, crate::dao::DaoState::genesis());
+                    let mut dao = std::mem::replace(&mut temp.dao, crate::dao::DaoState::genesis());
                     dao.apply_op(temp, tx.from, &op, block.height);
                     temp.dao = dao;
                 }
@@ -295,51 +304,5 @@ impl Chain {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The memo bytes the tests and the wire carry: a bincode-serialized
-    /// governance operation.
-    fn memo_of(op: &crate::dao::DaoOp) -> Option<Vec<u8>> {
-        Some(bincode::serialize(op).expect("DaoOp serializes"))
-    }
-
-    #[test]
-    fn emergency_lifeline_admits_only_resume_submissions() {
-        // The carve-out admits exactly one class — an EmergencyResume
-        // submission — and refuses every other memo shape, including
-        // other governance operations: under a user-transaction freeze
-        // votes and fresh pause proposals stop, only the lifting
-        // mechanism flows.
-        let resume = crate::dao::DaoOp::SubmitProposal {
-            payload: crate::dao::DaoPayload::EmergencyResume,
-        };
-        assert!(is_emergency_lifeline(&memo_of(&resume)));
-        let pause = crate::dao::DaoOp::SubmitProposal {
-            payload: crate::dao::DaoPayload::EmergencyPause {
-                flags: crate::dao::EMERGENCY_USER_TXS,
-                until_height: 100,
-            },
-        };
-        assert!(!is_emergency_lifeline(&memo_of(&pause)));
-        let vote = crate::dao::DaoOp::Vote {
-            proposal_id: 1,
-            approve: true,
-        };
-        assert!(!is_emergency_lifeline(&memo_of(&vote)));
-        assert!(!is_emergency_lifeline(&None));
-        assert!(!is_emergency_lifeline(&Some(b"garbage".to_vec())));
-    }
-
-    #[test]
-    fn governance_op_parse_is_shared_with_the_lifeline() {
-        // The freeze carve-out and the operation application consume the
-        // same parse: whatever the lifeline admits, the block applies.
-        let resume = crate::dao::DaoOp::SubmitProposal {
-            payload: crate::dao::DaoPayload::EmergencyResume,
-        };
-        let memo = memo_of(&resume);
-        assert!(parse_governance_op(&memo).is_some());
-        assert!(is_emergency_lifeline(&memo));
-    }
-}
+#[path = "txs_tests.rs"]
+mod tests;
