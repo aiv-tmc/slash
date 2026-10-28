@@ -80,7 +80,7 @@ Example of a bad comment:
 
 - Every bug fix must include a regression test.
 - Every new feature must include integration tests.
-- Use `setup_test_dir` from `tests/common/mod.rs` for tests that touch the filesystem.
+- Use `setup_test_dir` from `slash::test_fixtures` for tests that touch the filesystem.
 - Use `reset_testnet()` before tests that depend on mainnet genesis.
 
 ## Pull Request Process
@@ -116,4 +116,3 @@ Reference issues or pull requests: Closes #123, Relates to #456
 ## Questions?
 
 Open a [Discussion](https://github.com/slash-protocol/slash/discussions) or reach out in the development channel linked in the repository readme.
-

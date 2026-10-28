@@ -1,11 +1,12 @@
 [package]
 name = "slash"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 # Minimum supported Rust version. The codebase relies on integer
 # `is_multiple_of` (1.87) and `Option::is_none_or` (1.82).
 rust-version = "1.87"
 autobenches = false
+autotests = true
 
 [features]
 # Exposes the shared test fixtures as public library API. Test crates and
@@ -21,6 +22,7 @@ bincode = "1.3"
 blake3 = "1.5"
 chrono = "0.4"
 clap = { version = "4.5", features = ["derive"] }
+curve25519-dalek = "4.1"
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 futures = "0.3"
 hex = "0.4"
@@ -38,12 +40,31 @@ rpassword = "7.3"
 rust-randomx = "0.7"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sha2 = "0.10"
 tokio = { version = "1", features = ["full"] }
 x25519-dalek = { version = "2.0", features = ["static_secrets"] }
 zeroize = { version = "1.7", features = ["derive"] }
 aes-gcm = "0.10"
 argon2 = "0.5"
 anyhow = "1.0"
+
+# RandomX is a pure compute library: its C core gains nothing from a
+# debug build, and at -O0 every context initialization costs seconds,
+# which pushes every debug-profile test that mines or verifies a block
+# past any reasonable time budget. The crate builds its C core through
+# its own build script, so pinning the crate to full optimization in the
+# dev profile pins the library too.
+[profile.dev.package.rust-randomx]
+opt-level = 3
+
+# Thin LTO across the crate graph plus a single codegen unit recovers
+# 10-25% on the hashing and serialization hot paths (sighash, page
+# roots, block body hash) at the cost of a longer release link. Panic
+# stays unwind: the FFI boundary and the recovery journal catch panics
+# per call, so "abort" would change observable behavior.
+[profile.release]
+lto = "thin"
+codegen-units = 1
 
 # Benchmark-only crates stay out of the release dependency graph so that
 # production builds do not compile the Criterion harness.
@@ -54,6 +75,61 @@ criterion = { version = "0.5", features = ["html_reports"] }
 # `slash::test_fixtures` resolves in integration tests and benches without
 # passing command-line feature flags.
 slash = { path = ".", features = ["test-utils"] }
+
+# Test crates living in subdirectories are not auto-discovered: each one
+# needs an explicit target pointing at its entry file. Keep this list in
+# sync when adding a tests/<name>/main.rs crate.
+[[test]]
+name = "chain_tests"
+path = "tests/chain_tests/main.rs"
+
+[[test]]
+name = "dao_tests"
+path = "tests/dao_tests/main.rs"
+
+[[test]]
+name = "dev_fee_tests"
+path = "tests/dev_fee_tests/main.rs"
+
+[[test]]
+name = "emission_harness_tests"
+path = "tests/emission_harness_tests/main.rs"
+
+[[test]]
+name = "era_nine_boundary_tests"
+path = "tests/era_nine_boundary_tests/main.rs"
+
+[[test]]
+name = "integration_tests"
+path = "tests/integration_tests/main.rs"
+
+[[test]]
+name = "p2p_tests"
+path = "tests/p2p_tests/main.rs"
+
+[[test]]
+name = "reorg_persistence_tests"
+path = "tests/reorg_persistence_tests/main.rs"
+
+[[test]]
+name = "slow_chain_tests"
+path = "tests/slow_chain_tests/main.rs"
+
+[[test]]
+name = "soak_invariants_tests"
+path = "tests/soak_invariants_tests/main.rs"
+
+[[test]]
+name = "soak_network_tests"
+path = "tests/soak_network_tests/main.rs"
+
+[[test]]
+name = "treasury_tests"
+path = "tests/treasury_tests/main.rs"
+
+[[test]]
+name = "wire_format_tests"
+path = "tests/wire_format_tests/main.rs"
 
 # The Criterion harness requires a single entry point. The measurements
 # live in the benches/ modules so every file stays readable;

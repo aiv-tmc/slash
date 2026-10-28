@@ -1,5 +1,6 @@
 # Slash Protocol
 
+[![CI](https://github.com/slash-protocol/slash/actions/workflows/ci.yml/badge.svg)](https://github.com/slash-protocol/slash/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.87%2B-orange.svg)](https://www.rust-lang.org)
 
@@ -13,7 +14,7 @@ Slash introduces a **Paged Multi-Input State (PMIS)** engine that partitions a g
 - **Atomic cross-page transactions** with speculative execution and rollback.
 - **Light-client verification** through per-page Merkle roots and compact proofs.
 - **Stake-locking** at the cell level for time-bound ownership.
-- **Emission-backed security**: a Bitcoin-like subsidy schedule funds the RandomX hash rate from day one.
+- **Emission-backed security**: a Bitcoin-like subsidy schedule funds the RandomX hash rate from day one, and a perpetual one-cell-per-block slot tail keeps paying the miner after the subsidy ends.
 
 Consensus is secured by **RandomX proof-of-work**, ensuring CPU-friendly and ASIC-resistant mining. The network supports soft-fork upgrades through **BIP-9 style version bits** with real signal counting and threshold enforcement.
 
@@ -32,13 +33,18 @@ Consensus is secured by **RandomX proof-of-work**, ensuring CPU-friendly and ASI
 
 ### Emission Schedule
 - **Coinbase subsidy** of 500 cells per block at genesis, halving every 4 years (420,480 blocks at a 300-second target).
-- Nine eras; total emission **417,957,120 cells (~41.8 % of supply)** over ~36 years, after which security is fee-funded.
+- Nine eras; total emission **417,957,120 cells (~41.8 % of supply)** over ~36 years. From era 9 on, miner revenue is transaction fees **plus the perpetual one-cell slot tail** paid every block forever — the slot mint never stops (see `PERPETUAL_TAIL_EMISSION.md` for the decision record).
 - Coinbase is a mandatory `txs[0]` treasury transaction paying the miner exactly `subsidy_at(height)`; all other treasury transactions require the treasury signer key.
 
 ### Governance (Version Bits)
 - Soft-fork deployments track lifecycle states: `Defined → Started → LockedIn → Active / Failed`.
-- Real cumulative signal counting against configurable thresholds.
+- Real cumulative signal counting against configurable thresholds; the tally of a window is evaluated by its closing block and the counter opens fresh with the next one.
 - Active rules include `MinTxAmount`, `MaxBlockSize`, `AllowScheme1`, and `RequireBlockVersion2`.
+
+### On-Chain DAO
+- Proposals and votes ride transaction memos; weight is locked supply pinned at the proposal snapshot.
+- Treasury movements execute only through passed proposals once `dao_v1` activates; the legacy signer loses authority at activation.
+- An `EmergencyPause` freezes flagged transaction classes without halting blocks, bounded to a horizon governance can always revisit; an `EmergencyResume` submission is the lifeline admitted while the broad freeze is live.
 
 ### Onion Routing
 - Three-hop onion envelopes with fixed-size layers (1024 bytes) and inner payloads (2048 bytes).
@@ -101,14 +107,22 @@ cargo bench
 ## Running a Node
 
 ```bash
-# Start a full node on the default P2P port (0.0.0.0:30333) and RPC port (0.0.0.0:9944)
+# Start a full node: RPC binds loopback only (safe default)
 ./target/release/slash-node --port 30333 --rpc-port 9944
+
+# Expose the RPC port on every interface: control methods (stop, mine)
+# require a token — an unauthenticated control socket is a remote
+# shutdown vector
+./target/release/slash-node --rpc-external --rpc-token <token> --port 30333 --rpc-port 9944
 
 # Start in testnet mode
 ./target/release/slash-node --testnet --port 30333 --rpc-port 9944
 
 # Start in pruned mode (keeps only the last 10,000 blocks)
 ./target/release/slash-node --pruned --port 30333 --rpc-port 9944
+
+# Mine with an authorized key: the coinbase and fee claims pay the key's address
+./target/release/slash-node --miner-key <hex-secret> --port 30333 --rpc-port 9944
 ```
 
 ## Project Structure
@@ -116,29 +130,62 @@ cargo bench
 ```
 slash/
 ├── src/
-│   ├── lib.rs           # Crate root, testnet flag, save/load helpers
-│   ├── chain.rs         # Block, Chain, validation, coinbase rules, PoW verification, version bits
-│   ├── state.rs         # PMIS engine, Page, State, transactions, min-fee rule, balance cache
-│   ├── crypto.rs        # Ed25519, X25519, AES-GCM, Argon2id, wallet encryption
-│   ├── mining.rs        # RandomX miner with parallel extranonce search
-│   ├── p2p.rs           # libp2p swarm, mempool, sync, onion unicast forwarding
-│   ├── rpc.rs           # JSON-RPC HTTP server (balance, block, tx, proofs)
-│   ├── governance.rs    # Soft-fork rule registry and active rule validation
-│   ├── storage.rs       # Atomic file writes, snapshots, pruned recovery
-│   ├── treasury.rs      # Cell-denominated bonding curve math and treasury state
-│   ├── onion.rs         # 3-hop onion envelope construction and peeling
-│   ├── ffi.rs           # C-API for external wallet integration
-│   └── simulation.rs    # Economic stress tests (emission, hashrate drop, fee spike)
+│   ├── lib.rs               # Crate root, testnet flag, save/load helpers, RPC chain cache
+│   ├── main.rs              # Node binary: CLI, startup, RPC + event loop wiring
+│   ├── chain/               # Blocks, validation, coinbase rules, PoW, version bits, reorg
+│   │   ├── pow.rs           # Proof-of-work input builder and verifier
+│   │   ├── difficulty.rs    # Retarget arithmetic
+│   │   ├── subsidy.rs       # Emission schedule
+│   │   ├── sighash.rs       # Transaction signature hash
+│   │   ├── version_bits.rs  # Deployment lifecycle types
+│   │   ├── deployments.rs   # Per-window signal counting
+│   │   ├── validation.rs    # Mempool admission gates, header batch validation
+│   │   ├── execution/       # Block execution pipeline (meta, transactions, pairing)
+│   │   ├── meta.rs          # Header checks: linkage, median time, checkpoints
+│   │   ├── history.rs       # Reorg window, state snapshots
+│   │   └── ingress.rs       # Fork/orphan pool admission with byte budgets
+│   ├── state/               # PMIS engine: pages, transfers, locks, selection, minting
+│   │   ├── transfer.rs      # Staging/commit pipeline (shared by engine and admission)
+│   │   ├── transfer_gates.rs# The shared predicate core
+│   │   ├── transfer_speculative.rs # The read-only admission twin
+│   │   ├── locks.rs         # Lock registration, pruning, spend gating
+│   │   ├── minting.rs       # Slot mint, conservation invariants
+│   │   └── selection.rs     # Canonical range selection
+│   ├── dao/                 # On-chain governance: types, state, weights, payloads
+│   ├── treasury.rs          # Bonding-curve math and treasury state
+│   ├── crypto.rs            # Ed25519, X25519, AES-GCM, Argon2id, wallets
+│   ├── mining.rs            # RandomX miner with extranonce search
+│   ├── p2p/                 # libp2p swarm, mempool, sync, onion forwarding
+│   │   ├── limits.rs        # Cost-priced request budgets, byte charges
+│   │   ├── conn.rs          # Subnet/node-wide connection budgets
+│   │   ├── replay.rs        # Onion replay cache
+│   │   └── handlers/        # Sync, gossip, wire handlers
+│   ├── rpc/                 # JSON-RPC HTTP server and method handlers
+│   ├── storage/             # Atomic writes, manifest, crash-recovery journal
+│   ├── onion/               # 3-hop envelope construction and peeling
+│   ├── governance.rs        # Soft-fork rule registry
+│   ├── global_root.rs       # Incremental global root
+│   ├── ffi.rs               # C-API for external wallet integration
+│   ├── simulation.rs        # Economic stress tests
+│   └── test_fixtures/       # Shared fixtures (test-utils feature)
 ├── benches/
-│   └── benchmarks.rs    # Criterion benchmarks for tx, PoV, serialization
+│   ├── main.rs              # Criterion entry point
+│   └── <group>.rs           # Benchmark groups (tx, pov, serialization, ...)
 ├── tests/
-│   ├── chain_tests.rs   # End-to-end chain, consensus, coinbase, emission tests
-│   ├── crypto_tests.rs  # Signature, encryption, and wallet tests
-│   ├── p2p_tests.rs     # Wire format, mempool policy, DoS resistance tests
-│   ├── storage_tests.rs # Atomic storage, snapshot, recovery tests
-│   ├── treasury_tests.rs# Bonding curve and treasury pairing tests
-│   ├── onion_tests.rs   # Layered decryption and constant-size tests
-│   └── integration_tests.rs # Wallet encryption, sync, staking, pruning
+│   ├── chain_tests/         # Consensus, coinbase, emission, forks, limits
+│   ├── dao_tests/           # Governance lifecycle, payloads, provenance
+│   ├── dev_fee_tests/       # Dev-fund activation and spend rules
+│   ├── emission_harness_tests/ # Era boundary vectors
+│   ├── era_nine_boundary_tests/ # Zero-subsidy boundary
+│   ├── integration_tests/ # Wallet, sync, staking, pruning, persistence
+│   ├── p2p_tests/           # Wire format, mempool policy, DoS resistance
+│   ├── reorg_persistence_tests/ # Reorgs across restarts
+│   ├── slow_chain_tests/    # CPU-heavy consensus walks
+│   ├── soak_invariants_tests/   # Long-run conservation soaks
+│   ├── soak_network_tests/  # Multi-node fork soaks
+│   ├── treasury_tests/      # Bonding-curve pairing
+│   ├── wire_format_tests/   # Codec and frame bounds
+│   └── <standalone>.rs    # crypto, onion, storage, ffi, version-bits windows
 ├── Cargo.toml
 ├── README.md
 ├── LICENSE
@@ -149,7 +196,7 @@ slash/
 
 ## JSON-RPC API
 
-The node exposes a JSON-RPC 2.0 HTTP endpoint.
+The node exposes a JSON-RPC 2.0 HTTP endpoint. It binds loopback by default; `--rpc-external` exposes it on every interface and requires `--rpc-token`, without which the server refuses to start — the `stop` and `mine` methods accept unauthenticated calls only on the loopback bind.
 
 | Method | Params | Description |
 |--------|--------|-------------|
@@ -159,6 +206,8 @@ The node exposes a JSON-RPC 2.0 HTTP endpoint.
 | `getTip` | `[]` | Returns the current tip height and block hash. |
 | `getDifficulty` | `[]` | Returns the difficulty target for the next block. |
 | `getPageProof` | `[cell_index]` | Returns a Merkle proof for the page containing the cell. |
+
+Control methods: `stop` and `mine` forward to the node command channel. On an external bind they require the token as the first string param or as a `{"token": "..."}` object.
 
 Example:
 ```bash
@@ -181,8 +230,8 @@ A C-compatible API is provided for hardware wallet and mobile integration:
 
 ## Network Identifiers
 
-- **Mainnet**: `/slash/0.5.0`
-- **Testnet**: `/slash/test/0.5.0`
+- **Mainnet**: `/slash/0.6.0`
+- **Testnet**: `/slash/test/0.6.0`
 
 The `TESTNET_MODE` atomic boolean switches signature hashing between the two chain IDs, preventing replay across networks.
 
@@ -201,7 +250,7 @@ The `TESTNET_MODE` atomic boolean switches signature hashing between the two cha
 | 8 | 3,363,840 – 3,784,319 | 1 | 420,480 |
 | 9+ | from 3,784,320 | 0 | 0 |
 
-Total: **417,957,120 cells (~41.8 % of N)**. See `SLASH_EMISSION_AND_TREASURY_DESIGN.md` for the full specification.
+Total: **417,957,120 cells (~41.8 % of N)**. From era 9 onward the miner still receives exactly one slot cell per block, forever; see `PERPETUAL_TAIL_EMISSION.md` and `SLASH_EMISSION_AND_TREASURY_DESIGN.md` for the full specifications.
 
 ## Security
 
