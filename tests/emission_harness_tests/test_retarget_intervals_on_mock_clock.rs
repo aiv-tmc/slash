@@ -1,4 +1,5 @@
-//! `test_retarget_intervals_on_mock_clock` — one test case of the `emission_harness_tests` suite.
+//! `test_retarget_intervals_on_mock_clock` — one test case of the
+//! `emission_harness_tests` suite.
 //!
 //! The shared imports and helpers come from the crate root via
 //! `use super::*;`; only this test's body lives here.
@@ -10,9 +11,12 @@ fn test_retarget_intervals_on_mock_clock() {
     // Exercise the difficulty retarget across four consecutive intervals on
     // a mock clock by pushing synthetic headers (no proof-of-work is
     // required because the retarget formula reads only timestamps and
-    // difficulties). Interval steps are chosen so that two intervals land
-    // inside the 4x clamp and two intervals land exactly on the clamp
-    // boundaries.
+    // difficulties). The retarget rule is relative: each interval the
+    // difficulty multiplies by the measured ratio (target interval time
+    // over actual window time), clamped to one quarter and four times the
+    // previous interval's difficulty, never below one. The step spacings
+    // are chosen so one interval lands on the lower clamp, one stays on
+    // target, one lands on the upper clamp, and one overshoots it.
     reset_testnet();
     let mut chain = slash::chain::Chain::genesis();
     let miner = [3u8; 32];
@@ -35,14 +39,15 @@ fn test_retarget_intervals_on_mock_clock() {
             page_roots: BTreeMap::new(),
         });
     }
+    // (spacing, expected difficulty after the interval).
     let steps = [
-        (600u64, 1u64), // 2x slow -> difficulty halves toward 1
-        (300, 1),       // on target -> unchanged
-        (75, 4),        // 4x fast -> clamp boundary, difficulty x4
-        (74, 4),        // past the clamp -> still exactly 4x
+        (600u64, 1u64), // 2x slow -> ratio 1/2 -> lower clamp: 1
+        (300, 1),       // on target -> ratio 1 -> unchanged
+        (75, 4),        // 4x fast -> ratio 4 -> upper clamp: 4
+        (1_500, 1),     // 5x slow -> ratio 1/5 -> lower clamp: 1
     ];
     let mut expected = 1u64;
-    for (spacing, _clamped) in steps {
+    for (spacing, expected_after) in steps {
         let start_time = chain.blocks.last().unwrap().time;
         for i in 0..slash::chain::DIFFICULTY_ADJUSTMENT_INTERVAL {
             let h = chain.blocks.len() as u64 + 1;
@@ -61,8 +66,10 @@ fn test_retarget_intervals_on_mock_clock() {
             });
         }
         expected = chain.next_difficulty();
+        assert_eq!(
+            expected, expected_after,
+            "spacing {spacing}s must retarget to {expected_after}"
+        );
     }
-    // After the on-target interval the difficulty must read 1, and after the
-    // two clamped fast intervals it must read exactly 4.
-    assert_eq!(chain.next_difficulty(), 4);
+    assert_eq!(chain.next_difficulty(), 1);
 }

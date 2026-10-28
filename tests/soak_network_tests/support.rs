@@ -1,89 +1,134 @@
-//! Shared infrastructure of the network soak: a deterministic
-//! pseudo-random generator and the in-memory node wrapper that the
-//! builders and the driver operate on.
+//! Node fixture of the network soak: an independent miner with its own
+//! chain, standing in for one node of the simulated network, plus the
+//! deterministic generator the builders draw from.
 
 use super::*;
+use slash::chain::Chain;
 
-/// Deterministic xorshift64 generator. The fixed seed keeps the soak
-/// reproducible: a failing run can be replayed operation by operation.
+/// Deterministic generator over a wrapped u64 state: every draw mixes
+/// the state and takes it modulo the bound, so a soak run is a pure
+/// function of its seed and replays bit for bit.
 pub struct Rng(pub u64);
 
 impl Rng {
-    /// Advance the generator and return the next 64-bit value. The method
-    /// is named `advance` rather than `next` so it never reads as the
-    /// `Iterator` protocol: the generator is a plain state machine, not
-    /// an iterator adapter.
-    pub fn advance(&mut self) -> u64 {
-        let mut x = self.0;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.0 = x;
-        x
+    /// The next draw in `[0, bound)`.
+    pub fn below(&mut self, bound: u64) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (self.0 >> 33) % bound.max(1)
     }
 
-    /// Uniform value in `[0, n)`.
-    pub fn below(&mut self, n: u64) -> u64 {
-        self.advance() % n
+    /// The next draw in `[0, bound]`, both ends inclusive.
+    pub fn below_inclusive(&mut self, bound: u64) -> u64 {
+        self.below(bound.saturating_add(1))
     }
 }
 
-/// One in-memory node: a chain and the node's deterministic miner
-/// keypair, addressed by a display name used in failure messages.
+/// One soak node: an independent miner with its own private chain. The
+/// simulation never opens sockets; the node's private chain stands in
+/// for its view of the network, and the driver asserts the per-node
+/// invariants after every operation.
 pub struct Node {
-    pub name: &'static str,
-    pub chain: slash::chain::Chain,
+    pub id: usize,
     pub miner_sk: [u8; 32],
     pub miner_pk: [u8; 32],
+    pub chain: Chain,
 }
 
 impl Node {
-    /// Create a node on a fresh treasury genesis with a miner keypair
-    /// derived deterministically from the node name.
-    pub fn new(name: &'static str) -> Self {
-        let mut seed = [0u8; 32];
-        for (i, b) in name.as_bytes().iter().enumerate() {
-            seed[i % 32] ^= b;
-        }
-        let miner_sk = seed;
-        let miner_pk = slash::crypto::public_from_secret(&seed);
-        Node {
-            name,
-            chain: treasury_genesis(),
+    /// Fresh node: a random keypair and a genesis chain.
+    pub fn new(label: &str) -> Self {
+        let _tmp = setup_test_dir(label);
+        reset_testnet();
+        let (miner_sk, miner_pk) = slash::crypto::generate_keypair();
+        Self {
+            id: 0,
             miner_sk,
             miner_pk,
+            chain: Chain::genesis(),
         }
     }
 
-    /// Build the next block carrying `txs` for this node's miner and
-    /// apply it, returning the applied block so the driver can track
-    /// heights.
-    pub fn mine(&mut self, txs: Vec<slash::chain::Tx>) -> slash::chain::Block {
-        let b = mine_next_block(&self.chain, self.miner_pk, txs);
-        self.chain.apply(b.clone()).expect("soak block must apply");
-        b
+    /// Mine one block carrying `payload` onto the node's private chain.
+    ///
+    /// The soak exercises the multi-chain bookkeeping and the consensus
+    /// state transitions — coinbase, slot mint, transactions, pairing —
+    /// and never the proof of work, so the block is built without
+    /// RandomX: the nonce stays zero and the block applies through the
+    /// recovery path, which executes the identical state transition and
+    /// skips only the header checks. The PoW slot is the first
+    /// treasury-owned cell at or after the coinbase range that no
+    /// transaction input claims: the slot mint executes before the
+    /// transactions, so it must not confiscate any claimed cell. The
+    /// scan is bounded by the total cell supply — the slot selection is
+    /// a pure function of the block and the pre-block state, so the
+    /// bound can only be hit by a construction defect, and it panics
+    /// with the frontier instead of scanning forever.
+    pub fn mine(&mut self, payload: &[slash::chain::Tx]) -> bool {
+        let height = self.chain.tip_height() + 1;
+        let miner = self.miner_pk;
+        let mut txs: Vec<slash::chain::Tx> = Vec::new();
+        let mut frontier = 0u64;
+        if slash::chain::subsidy_at(height) > 0 {
+            let coinbase = slash::chain::Chain::build_coinbase(&self.chain.state, miner, height, 0)
+                .expect("coinbase while the subsidy is positive");
+            frontier = coinbase.inputs.first().map(|&(_, e)| e).unwrap_or(0);
+            txs.push(coinbase);
+        }
+        txs.extend_from_slice(payload);
+        let slot = {
+            let mut candidate = frontier;
+            loop {
+                let treasury = self
+                    .chain
+                    .state
+                    .get(candidate)
+                    .is_some_and(|(_, _, owner)| owner == slash::state::TREASURY);
+                let claimed = txs.iter().any(|tx| {
+                    tx.inputs
+                        .iter()
+                        .any(|&(s, e)| candidate >= s && candidate < e)
+                });
+                if treasury && !claimed {
+                    break candidate;
+                }
+                candidate += 1;
+                assert!(
+                    candidate < slash::state::N,
+                    "slot search exhausted the cell supply at frontier {frontier} \
+                     (tip {}, block txs {:?})",
+                    self.chain.tip_height(),
+                    txs.iter().map(|t| t.inputs.clone()).collect::<Vec<_>>()
+                );
+            }
+        };
+        let block = slash::chain::Block {
+            version: 1,
+            prev: self.chain.tip_hash(),
+            time: 1_700_000_000 + height,
+            height,
+            nonce: 0,
+            miner,
+            mined_cell: slot,
+            txs,
+            fee_claims: Vec::new(),
+            difficulty: 1,
+            page_roots: std::collections::BTreeMap::new(),
+        };
+        self.chain.apply_recovered(block).is_ok()
     }
 }
 
-/// Recompute the total supply by walking every page's ownership ranges
-/// and summing their widths; the result must always equal N, pinning the
-/// cell-conservation invariant independently of the balance cache. The
-/// ownership ranges are keyed by start cell; each range records its end
-/// and owner, so the width is `end - key`.
-pub fn assert_invariants(node: &mut Node) {
-    let mut total = 0u128;
-    for id in 0..slash::state::page_count() {
-        let page = node.chain.state.get_page(id);
-        for (&start, r) in page.ranges.iter() {
-            total += (r.e - start) as u128;
-        }
-    }
+/// The conservation invariant: the balance cache is the O(1) mirror of
+/// the ledger and must always sum to exactly N cells.
+pub fn assert_invariants(node: &Node) {
+    let supply: u64 = node.chain.state.balance_cache.values().sum();
     assert_eq!(
-        total,
-        slash::state::N as u128,
-        "{}: conservation violated",
-        node.name
+        supply,
+        slash::state::N,
+        "node {}: conservation invariant violated",
+        node.id
     );
-    let tip = node.chain.tip_hash();
-    assert!(!tip.is_empty(), "{}: empty tip hash", node.name);
 }

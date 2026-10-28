@@ -9,9 +9,12 @@ use super::*;
 #[test]
 fn test_coinbase_amount_matches_schedule() {
     // Every era's first block pays the exact era subsidy, and the first
-    // era-9 block omits the coinbase entirely.
+    // era-9 block omits the coinbase entirely. Era zero uses height one:
+    // height zero is the genesis itself, which carries no coinbase
+    // transaction; every height in era zero pays the era-zero subsidy, so
+    // height one pins the same vector.
     for era in 0..9u64 {
-        let h = era * slash::chain::HALVING_INTERVAL;
+        let h = (era * slash::chain::HALVING_INTERVAL).max(1);
         let chain = chain_with_next_height(h);
         let miner = [7u8; 32];
         let block = prepared_tail_block(&chain, miner, true);

@@ -1,4 +1,5 @@
-//! `test_mempool_double_spend_rejected_at_block_level` — one test case of the `p2p_tests` suite.
+//! `test_mempool_double_spend_rejected_at_block_level` — one test case of
+//! the `p2p_tests` suite.
 //!
 //! The shared imports and helpers come from the crate root via
 //! `use super::*;`; only this test's body lives here.
@@ -16,52 +17,61 @@ fn test_mempool_double_spend_rejected_at_block_level() {
     let (sk, pk) = crypto::generate_keypair();
     let alice = pk;
 
-    // Seed alice with 50 cells; both transactions below are individually
+    // Seed alice by direct mining: a treasury mint without a matching buy
+    // payment is invalid by the pairing rules, so it cannot seed a test
+    // that is not about pairing. Both transactions below are individually
     // well-formed and correctly signed.
-    let seed = chain::Output {
-        start: 0,
-        end: 50,
-        to: alice,
-        lock: None,
-    };
-    let seed_tx = chain::Tx {
-        from: state::TREASURY,
-        inputs: vec![(0, 50)],
-        outputs: vec![seed],
-        sig: vec![],
-        scheme: 0,
-        memo: None,
-    };
-    let b1 = mine_next_block(&chain, state::TREASURY, vec![seed_tx]);
-    chain.apply(b1).unwrap();
+    for i in 0..50 {
+        chain.state.mine(i, alice, 0);
+    }
 
     let tx1 = make_tx(
         alice,
         &sk,
         &[(0, 50)],
-        &[state::Output {
-            start: 0,
-            end: 50,
-            to: bob,
-            lock: None,
-        }],
+        &[
+            state::Output {
+                start: 0,
+                end: 49,
+                to: bob,
+                lock: None,
+            },
+            state::Output {
+                start: 49,
+                end: 50,
+                to: state::FEE_VAULT,
+                lock: None,
+            },
+        ],
         &chain.chain_id,
     );
     let tx2 = make_tx(
         alice,
         &sk,
         &[(0, 50)],
-        &[state::Output {
-            start: 0,
-            end: 50,
-            to: charlie,
-            lock: None,
-        }],
+        &[
+            state::Output {
+                start: 0,
+                end: 49,
+                to: charlie,
+                lock: None,
+            },
+            state::Output {
+                start: 49,
+                end: 50,
+                to: state::FEE_VAULT,
+                lock: None,
+            },
+        ],
         &chain.chain_id,
     );
 
     // The first spend consumes the range during the state replay, so the
-    // second one no longer finds it owned by alice and the block is invalid.
-    let b2 = mine_next_block(&chain, state::TREASURY, vec![tx1, tx2]);
+    // second one no longer finds it owned by alice and the block is
+    // invalid. The pair is injected into a valid empty template because
+    // the mining fixture panics on templates it cannot execute.
+    let mut b2 = mine_next_block(&chain, [1u8; 32], vec![]);
+    b2.txs.push(tx1);
+    b2.txs.push(tx2);
     assert!(!chain.validate_block(&b2));
 }

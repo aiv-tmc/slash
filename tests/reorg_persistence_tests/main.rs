@@ -1,77 +1,112 @@
-//! Regression tests for reorganization safety and restart persistence.
-//!
-//! These tests pin the three consensus-critical guarantees: a reorg that
-//! would roll back past the available state history is rejected without
-//! touching the chain; a reorg within the available history succeeds and
-//! replaces the tip; and a restarted node restores its deployments,
-//! checkpoints, and exact reorg window.
+//! Tests for reorg persistence behaviors: governance and checkpoint
+//! persistence across restarts, and the reorg fail-closed posture when
+//! the history is unavailable.
 
 use slash::chain::{Block, BlockError, BlockProcessResult, Chain, Deployment, DeploymentStatus};
-use slash::state;
+use slash::state::State;
 use slash::test_fixtures::*;
 
-/// Build a block that extends `prev_hash` at `height` with a coinbase
-/// computed against `pre_state`, grinding the nonce until the proof-of-work
-/// slot lands on a treasury-owned cell outside the coinbase inputs. This
-/// mirrors the consensus rule that a slot may never confiscate a user cell
-/// or collide with the coinbase range.
+mod test_reorg_rejected_without_history;
+mod test_reorg_succeeds_after_restart;
+mod test_reorg_succeeds_with_history;
+mod test_restart_persists_governance_and_history;
+
+/// Convert chain transaction outputs to engine outputs.
+fn state_outputs(outs: &[slash::chain::Output]) -> Vec<slash::state::Output> {
+    outs.iter()
+        .map(|o| slash::state::Output {
+            start: o.start,
+            end: o.end,
+            to: o.to,
+            lock: o.lock,
+        })
+        .collect()
+}
+
+/// Build a chain with `n` main blocks above genesis.
+fn chain_with_blocks(n: u64) -> (Chain, [u8; 32]) {
+    let main_miner = [1u8; 32];
+    let mut chain = treasury_genesis();
+    for _ in 0..n {
+        let b = mine_next_block(&chain, main_miner, vec![]);
+        chain.apply(b).unwrap();
+    }
+    (chain, main_miner)
+}
+
+/// Build one block extending `prev_hash` at `height` against `state`,
+/// mirroring the consensus-internal fork path: coinbase selected against
+/// `state`, nonce ground until the PoW slot is treasury-owned in `state`,
+/// and the page roots left empty — the caller roots the block against the
+/// state it was built on.
 fn fork_block(
-    pre_state: &state::State,
+    state: &State,
     prev_hash: [u8; 32],
     height: u64,
     miner: [u8; 32],
-    time: u64,
+    timestamp: u64,
 ) -> Block {
-    let coinbase = Chain::build_coinbase(pre_state, miner, height, 0);
-    let range = coinbase.as_ref().and_then(|c| c.inputs.first().copied());
-    let mut txs: Vec<slash::chain::Tx> = Vec::new();
-    if let Some(cb) = coinbase {
-        txs.push(cb);
-    }
+    let difficulty = 1;
+    let subsidy = slash::chain::subsidy_at(height);
+    let (s, e) = state
+        .select_single(slash::state::TREASURY, subsidy)
+        .expect("treasury must fund the fork coinbase");
+    let coinbase_inputs: Vec<(u64, u64)> = vec![(s, e)];
+    let coinbase = slash::chain::Tx {
+        from: slash::state::TREASURY,
+        inputs: coinbase_inputs.clone(),
+        outputs: vec![slash::chain::Output {
+            start: s,
+            end: e,
+            to: miner,
+            lock: None,
+        }],
+        sig: Vec::new(),
+        scheme: 0,
+        memo: None,
+    };
     let mut b = Block {
         version: 1,
         prev: prev_hash,
-        time,
+        time: timestamp,
         height,
         nonce: 0,
         miner,
         mined_cell: 0,
-        txs,
-        fee_claims: vec![],
-        difficulty: 1,
-        page_roots: Default::default(),
+        txs: vec![coinbase],
+        fee_claims: Vec::new(),
+        difficulty,
+        page_roots: std::collections::BTreeMap::new(),
     };
     loop {
         if let Some(cell) =
             slash::chain::verify_pow(b.prev, b.time, b.height, b.miner, b.nonce, b.difficulty)
         {
-            let hits_coinbase = range.is_some_and(|(s, e)| cell >= s && cell < e);
-            let treasury_owned = pre_state
+            let treasury_owned = state
                 .get(cell)
-                .is_some_and(|(_, _, owner)| owner == state::TREASURY);
-            if !hits_coinbase && treasury_owned {
+                .is_some_and(|(_, _, owner)| owner == slash::state::TREASURY);
+            let in_tx_inputs = b
+                .txs
+                .iter()
+                .any(|tx| tx.inputs.iter().any(|&(s, e)| cell >= s && cell < e));
+            if treasury_owned && !in_tx_inputs {
                 b.mined_cell = cell;
-                return b;
+                break;
             }
         }
         b.nonce += 1;
     }
+    b
 }
 
-/// Advance a fresh treasury-signer chain by `n` empty blocks and return it.
-fn chain_with_blocks(n: usize) -> (Chain, [u8; 32]) {
-    let mut chain = treasury_genesis();
-    let miner = [1u8; 32];
-    for _ in 0..n {
-        let b = mine_next_block(&chain, miner, vec![]);
-        chain.apply(b).unwrap();
-    }
-    (chain, miner)
+/// Fill a block's page roots by executing it against the state it was
+/// built on: a scratch chain with the given state installed prepares the
+/// block, so the header commits to the post-block state of that fork
+/// point. The node's own prepare path cannot serve here — it executes
+/// against the tip state, where a fork block's coinbase inputs are
+/// already spent.
+fn rooted(chain: &Chain, state: &State, block: Block) -> Block {
+    let mut scratch = chain.clone();
+    scratch.state = state.clone();
+    scratch.prepare_block(block)
 }
-
-// Test modules: every `#[test]` function of this crate lives
-// in its own small file under this directory for readability.
-mod test_reorg_rejected_without_history;
-mod test_reorg_succeeds_after_restart;
-mod test_reorg_succeeds_with_history;
-mod test_restart_persists_governance_and_history;

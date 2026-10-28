@@ -131,9 +131,16 @@ fn test_onion_constant_size() {
 
     let onion = onion::create_onion(&sample_payload_tx(), &[r1_pub, r2_pub, r3_pub]).unwrap();
     for layer in &onion.layers {
-        assert_eq!(layer.ciphertext.len(), 1024);
+        // The routing plaintext is padded to 1024 bytes and the AES-GCM
+        // ciphertext carries the 16-byte authentication tag on top, so
+        // the wire size of every layer is 1040 bytes for every envelope
+        // — the constant-size property the test pins. Peeling strips the
+        // tag during decryption, so both sides agree on the layout.
+        assert_eq!(layer.ciphertext.len(), 1024 + 16);
     }
-    assert_eq!(onion.inner.len(), 2048);
+    // The inner transaction is padded to 2048 bytes and carries the same
+    // 16-byte tag.
+    assert_eq!(onion.inner.len(), 2048 + 16);
 }
 
 #[test]

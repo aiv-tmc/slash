@@ -14,7 +14,7 @@ fn test_auto_recovery_from_snapshot() {
     let mut chain = treasury_genesis();
     let miner = [1u8; 32];
     for _ in 0..5 {
-        let b = mine_next_block(&mut chain, miner, vec![]);
+        let b = mine_next_block(&chain, miner, vec![]);
         chain.apply(b).unwrap();
     }
     slash::save(&chain);

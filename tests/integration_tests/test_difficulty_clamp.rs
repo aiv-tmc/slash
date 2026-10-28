@@ -7,20 +7,37 @@ use super::*;
 
 #[test]
 fn test_difficulty_clamp() {
-    // Tenfold-fast blocks over a full retarget interval must raise the
-    // difficulty by exactly the 4x clamp factor, not more.
+    // The retarget formula reads only timestamps and difficulties, so the
+    // two clamp directions are exercised with synthetic headers on a mock
+    // clock: a full interval mined ten times faster than the target
+    // spacing demands ten times the difficulty but must cap at four, and a
+    // full interval mined eight times slower produces a fractional
+    // difficulty that must floor at one. The rescaled difficulty applies
+    // from the first block of the new interval onward, so the queries
+    // target interval boundaries rather than mid-window heights (mid-window
+    // heights inherit whatever difficulty the previous header declares,
+    // which the synthetic headers pin to one). Grinding two real windows
+    // of proofs would only re-test what the header arithmetic already pins.
+    let _tmp = setup_test_dir("difficulty_clamp");
+    reset_testnet();
     let mut chain = chain::Chain::genesis();
-    let miner = [1u8; 32];
 
-    for h in 1..=chain::DIFFICULTY_ADJUSTMENT_INTERVAL {
-        let mut b = mine_valid_block(&chain, h, miner, chain.next_difficulty());
-        b.time = h * chain::TARGET_BLOCK_TIME_SECS / 10;
-        let b = chain.prepare_block(b);
-        chain.apply(b).unwrap();
-    }
+    // Tenfold-fast window: the raw retarget is 10x, the upward clamp caps
+    // it at 4x, and the first block of the new interval carries 4.
+    let fast_step = chain::TARGET_BLOCK_TIME_SECS / 10;
+    push_synthetic_headers(&mut chain, chain::DIFFICULTY_ADJUSTMENT_INTERVAL, fast_step);
+    assert_eq!(
+        chain.difficulty_for_height(chain::DIFFICULTY_ADJUSTMENT_INTERVAL + 1),
+        4
+    );
 
-    let next = chain.next_difficulty();
-    let last = chain.blocks.last().unwrap().difficulty;
-    assert!(next <= last.saturating_mul(4));
-    assert!(next >= last.saturating_div(4).max(1));
+    // Eightfold-slow window: the raw retarget falls below one, and the
+    // difficulty floor raises the first block of the next interval back
+    // to the minimum of one.
+    let slow_step = chain::TARGET_BLOCK_TIME_SECS * 8;
+    push_synthetic_headers(&mut chain, chain::DIFFICULTY_ADJUSTMENT_INTERVAL, slow_step);
+    assert_eq!(
+        chain.difficulty_for_height(2 * chain::DIFFICULTY_ADJUSTMENT_INTERVAL + 1),
+        1
+    );
 }

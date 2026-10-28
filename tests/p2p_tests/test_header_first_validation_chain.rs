@@ -22,6 +22,12 @@ fn test_header_first_validation_chain() {
 
     for header in &headers {
         assert!(header.height > 0);
-        assert_ne!(header.prev, [0u8; 32]);
+        // Every header after the first names a real parent hash; the
+        // first header's parent is the all-zero genesis anchor, which is
+        // the one legitimate all-zero prev in the chain.
+        assert!(
+            header.prev != [0u8; 32] || header.height == 1,
+            "only the first header may point at the genesis anchor"
+        );
     }
 }

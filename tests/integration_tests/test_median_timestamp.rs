@@ -7,20 +7,24 @@ use super::*;
 
 #[test]
 fn test_median_timestamp() {
-    // The median-time rule averages the two middle timestamps of the
-    // eleven-block window for even window sizes.
+    // The median-time rule takes the element at index len/2 of the sorted
+    // window of the most recent blocks: for an even-sized window that is
+    // the upper of the two middle timestamps, matching the reference
+    // convention. The implicit genesis block never enters the block
+    // vector, so the window here holds exactly the five applied blocks.
+    // Block times are chosen before the nonce search so the proof binds
+    // the stamped time.
+    let _tmp = setup_test_dir("median_time");
+    reset_testnet();
     let mut chain = chain::Chain::genesis();
     let miner = [1u8; 32];
 
     for h in 1..=5 {
-        let mut b = mine_valid_block(&chain, h, miner, chain.next_difficulty());
-        b.time = h * 100;
+        let b = mine_valid_block(&chain, h * 100, miner, chain.next_difficulty());
         let b = chain.prepare_block(b);
         chain.apply(b).unwrap();
     }
 
-    // The window covers genesis (time 0) and blocks at 100..=500:
-    // sorted [0, 100, 200, 300, 400, 500] -> median (200 + 300) / 2 = 250.
-    let median = chain.median_timestamp();
-    assert_eq!(median, 250);
+    // Sorted window [100, 200, 300, 400, 500]: index 5 / 2 = 2 -> 300.
+    assert_eq!(chain.median_timestamp(), 300);
 }

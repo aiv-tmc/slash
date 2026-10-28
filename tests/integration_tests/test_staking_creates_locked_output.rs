@@ -35,29 +35,46 @@ fn test_staking_creates_locked_output() {
     assert_eq!(chain.state.balance(alice), 99);
 
     // Spending the locked range through the mempool entry point is
-    // rejected while the lock is live...
+    // rejected while the lock is live. The spend covers only the cells
+    // alice still owns: cell 99 left her control as the staking fee.
     let early = make_tx_at(
         &chain,
         alice,
         &alice_sk,
-        &[(0, 100)],
-        &[(0, 99, alice), (99, 100, state::FEE_VAULT)],
-        1000,
+        &[(0, 99)],
+        &[(0, 98, alice), (98, 99, state::FEE_VAULT)],
+        0,
     );
     assert!(!chain.validate_tx(&early));
 
-    // ...and accepted once the chain reaches the expiry height.
+    // Advance the tip to the expiry height with synthetic headers: lock
+    // spendability reads the lock maps and the executing height, never
+    // the proof of the blocks in between, so the hundreds of empty
+    // interstitial blocks are mock-clock headers, not mined proofs.
     while chain.tip_height() + 1 < 1000 {
-        let b = mine_next_block(&chain, miner, vec![]);
-        chain.apply(b).unwrap();
+        let next = chain.tip_height() + 1;
+        chain.blocks.push(slash::chain::Block {
+            version: 1,
+            prev: [0u8; 32],
+            time: 1_700_000_000 + next,
+            height: next,
+            nonce: 0,
+            miner,
+            mined_cell: 0,
+            txs: vec![],
+            fee_claims: vec![],
+            difficulty: 1,
+            page_roots: std::collections::BTreeMap::new(),
+        });
     }
+    // At the expiry height the locked range is spendable.
     let later = make_tx_at(
         &chain,
         alice,
         &alice_sk,
-        &[(0, 100)],
-        &[(0, 99, alice), (99, 100, state::FEE_VAULT)],
-        1000,
+        &[(0, 99)],
+        &[(0, 98, alice), (98, 99, state::FEE_VAULT)],
+        0,
     );
     assert!(chain.validate_tx(&later));
 }

@@ -8,14 +8,20 @@
 pub use slash::test_fixtures::*;
 pub use slash::*;
 
+mod test_auto_recovery_from_snapshot;
 mod test_block_hash_deterministic;
+mod test_difficulty_clamp;
 mod test_dos_spam_rejection;
+mod test_duplicate_block_rejected;
 mod test_empty_block_valid;
 mod test_genesis_chain_id;
 mod test_header_first_download_range;
+mod test_invalid_height_sequence;
+mod test_median_timestamp;
 mod test_mempool_overflow_eviction;
 mod test_multi_input_balance_per_page;
 mod test_p2p_sync_tip_request;
+mod test_pristine_page_root_constant;
 mod test_rate_limiting_simulation;
 mod test_reorg_state_consistency;
 mod test_select_single_contiguous;

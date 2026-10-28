@@ -18,10 +18,11 @@ const ERA_NINE_START: u64 = 3_784_320;
 
 /// Build a chain whose expected next height equals `next_height` without
 /// replaying millions of blocks: the retained window is moved by setting
-/// `base_height` while the block vector keeps the single genesis block, so
-/// `blocks.len() + base_height` lands on the requested height. Every
-/// consensus rule that reads the absolute height (subsidy era, coinbase
-/// requirement) evaluates exactly this sum.
+/// `base_height` while the block vector starts empty, so the tip formula
+/// (`base_height + blocks.len()`) lands on `next_height - 1` and the next
+/// block lands exactly on the requested height. Every consensus rule that
+/// reads the absolute height (subsidy era, coinbase requirement) evaluates
+/// exactly this sum.
 fn chain_with_next_height(next_height: u64) -> Chain {
     reset_testnet();
     let mut chain = treasury_genesis();
@@ -31,8 +32,13 @@ fn chain_with_next_height(next_height: u64) -> Chain {
 
 /// Build a valid proof-of-work block extending the current tip. The nonce is
 /// ground until the proof-of-work slot is treasury-owned in the pre-block
-/// state, mirroring the consensus rule that a slot may never confiscate a
-/// user cell.
+/// state and outside every transaction input, mirroring the consensus rule
+/// that a slot may never confiscate a user cell. The returned block is
+/// prepared against the chain, so its page roots commit to the post-block
+/// state and the block applies without a root mismatch; callers that
+/// assemble an intentionally invalid block overwrite the transaction list
+/// afterwards and observe the rejection through the ordinary validation
+/// path.
 fn build_pow_block(chain: &Chain, txs: Vec<chain::Tx>) -> chain::Block {
     let height = chain.tip_height() + 1;
     let mut b = chain::Block {
@@ -54,13 +60,18 @@ fn build_pow_block(chain: &Chain, txs: Vec<chain::Tx>) -> chain::Block {
                 .state
                 .get(cell)
                 .is_some_and(|(_, _, owner)| owner == slash::state::TREASURY);
-            if treasury_owned {
+            let in_tx_inputs = b
+                .txs
+                .iter()
+                .any(|tx| tx.inputs.iter().any(|&(s, e)| cell >= s && cell < e));
+            if treasury_owned && !in_tx_inputs {
                 b.mined_cell = cell;
-                return b;
+                break;
             }
         }
         b.nonce += 1;
     }
+    chain.prepare_block(b)
 }
 
 /// A structurally plausible unsigned treasury transaction minting 50 cells
