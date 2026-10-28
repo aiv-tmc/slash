@@ -81,7 +81,7 @@ jobs:
         run: |
           cd dist
           sha256sum slash-node-${{ matrix.suffix }}.tar.gz > slash-node-${{ matrix.suffix }}.tar.gz.sha256
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: slash-${{ matrix.suffix }}
           path: dist/*
