@@ -1,4 +1,5 @@
-//! `treasury_and_pairing_paths_exempt_from_dev_fee` — one test case of the `dev_fee_tests` suite.
+//! `treasury_and_pairing_paths_exempt_from_dev_fee` — one test case of
+//! the `dev_fee_tests` suite.
 //!
 //! The shared imports and helpers come from the crate root via
 //! `use super::*;`; only this test's body lives here.
@@ -7,15 +8,76 @@ use super::*;
 
 #[test]
 fn treasury_and_pairing_paths_exempt_from_dev_fee() {
-    // Treasury mints and the pairing payments that fund them never carry a
-    // dev-fund output; the rule must not reach them in either direction.
+    // The mint half of a buy pair never carries a dev-fund output, and
+    // the treasury address is exempt from the rule, so a fully paired
+    // buy block applies with the rule active even though the mint itself
+    // pays no dev share. The pairing payment is an ordinary user
+    // transaction and pays its own one-cell share. The coinbase stays
+    // clean because mine_fee_bps is zeroed.
+    //
+    // The mint inputs are the range immediately after the coinbase
+    // range: the coinbase claims the canonical frontier first inside the
+    // block, so a mint selecting the same canonical range would find it
+    // already spent and the pairing classification would fail. Reserving
+    // the successor range keeps the pair executable.
     reset_testnet();
     let mut chain = treasury_genesis();
     activate_dev_fund(&mut chain);
     chain.state.mine_fee_bps = 0;
-    // A treasury mint (signed against the treasury signer) without any
-    // dev-fund output must still validate at the mempool and in a block.
-    let (s, e) = chain.state.select_single(TREASURY, 500).unwrap();
+    let (sk, pk) = slash::crypto::generate_keypair();
+    // Fund the buyer high above the canonical treasury frontier so the
+    // coinbase and mint reservations stay at the page base.
+    for i in 10_000..11_000 {
+        chain.state.mine(i, pk, 0);
+    }
+    let cb_e = chain
+        .state
+        .select_single(TREASURY, 500)
+        .expect("the coinbase range")
+        .1;
+    let (s, e) = (cb_e, cb_e + 500);
+    // Buy payment: 500 cells to the vault (the curve price at the
+    // running position), the one-cell dev share the rule requires of a
+    // user transaction, a three-cell fee satisfying 0.5 %, and the
+    // change back to the buyer.
+    let payment_outputs = vec![
+        Output {
+            start: 10_000,
+            end: 10_500,
+            to: slash::state::TREASURY_VAULT,
+            lock: None,
+        },
+        Output {
+            start: 10_500,
+            end: 10_501,
+            to: DEV_FUND,
+            lock: None,
+        },
+        Output {
+            start: 10_501,
+            end: 10_504,
+            to: FEE_VAULT,
+            lock: None,
+        },
+        Output {
+            start: 10_504,
+            end: 10_600,
+            to: pk,
+            lock: None,
+        },
+    ];
+    let payment = make_tx(
+        pk,
+        &sk,
+        &[(10_000, 10_600)],
+        &payment_outputs,
+        &chain.chain_id,
+    );
+    assert!(
+        chain.validate_tx(&payment),
+        "the pairing payment is an ordinary user transaction and pays its share"
+    );
+    // The mint: treasury-signed, no dev output, exempt from the rule.
     let mint_outputs = vec![Output {
         start: s,
         end: e,
@@ -33,8 +95,9 @@ fn treasury_and_pairing_paths_exempt_from_dev_fee() {
         chain.validate_tx(&mint),
         "treasury transactions are exempt from the dev-fund rule"
     );
-    let b = mine_next_block(&chain, [7u8; 32], vec![mint]);
+    let b = mine_next_block(&chain, [7u8; 32], vec![payment, mint]);
     chain
         .apply(b)
-        .expect("treasury mint applies without a dev output");
+        .expect("the paired buy block applies with the rule active");
+    assert_eq!(chain.state.balance([9u8; 32]), 500);
 }

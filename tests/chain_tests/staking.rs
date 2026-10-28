@@ -1,33 +1,8 @@
-//! Staking tests: locks block spends until their height, and the miner
-//! rewards include the perpetual one-cell slot mint on top of the
-//! coinbase subsidy.
+//! Staking tests: a locked output cannot be spent before its height and
+//! becomes spendable exactly at it, with the heights between bridged by
+//! synthetic headers instead of mined blocks.
 
 use super::*;
-
-/// Push `count` synthetic headers onto the block vector without mining:
-/// the headers exist only to advance the tip, because lock spendability
-/// reads the lock maps and the executing height — never the proof of the
-/// blocks in between.
-fn push_synthetic_headers(chain: &mut slash::chain::Chain, count: u64) {
-    let mut time = chain.blocks.last().map(|b| b.time).unwrap_or(1_700_000_000);
-    for _ in 0..count {
-        time += 300;
-        let height = chain.tip_height() + 1;
-        chain.blocks.push(slash::chain::Block {
-            version: 1,
-            prev: [0u8; 32],
-            time,
-            height,
-            nonce: 0,
-            miner: [1u8; 32],
-            mined_cell: 0,
-            txs: Vec::new(),
-            fee_claims: Vec::new(),
-            difficulty: 1,
-            page_roots: std::collections::BTreeMap::new(),
-        });
-    }
-}
 
 #[test]
 fn test_stake_locks_until_height() {
@@ -90,7 +65,7 @@ fn test_stake_spendable_at_lock_height() {
     // height, so the empty blocks between the staking block and the lock
     // height are mock-clock headers, not mined proofs.
     while chain.tip_height() + 1 < 100 {
-        push_synthetic_headers(&mut chain, 1);
+        push_synthetic_headers(&mut chain, 1, chain::TARGET_BLOCK_TIME_SECS);
     }
     // At height 100 the locked range is spendable: cell 99 belongs to the
     // fee vault since the staking block, so the spend covers only the

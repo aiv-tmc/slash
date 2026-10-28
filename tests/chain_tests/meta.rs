@@ -8,34 +8,6 @@
 use super::*;
 use slash::chain;
 
-/// Push `count` synthetic headers onto the block vector without mining:
-/// every header declares difficulty one and advances a mock clock by the
-/// 300-second target spacing. Tests that read only timestamps,
-/// difficulties, and heights — retarget arithmetic, height advancement —
-/// use this instead of paying for thousands of RandomX proofs, since
-/// nothing in those code paths reads the proof, the state transition, or
-/// the header linkage.
-fn push_synthetic_headers(chain: &mut chain::Chain, count: u64) {
-    let mut time = chain.blocks.last().map(|b| b.time).unwrap_or(1_700_000_000);
-    for _ in 0..count {
-        time += 300;
-        let height = chain.tip_height() + 1;
-        chain.blocks.push(chain::Block {
-            version: 1,
-            prev: [0u8; 32],
-            time,
-            height,
-            nonce: 0,
-            miner: [1u8; 32],
-            mined_cell: 0,
-            txs: Vec::new(),
-            fee_claims: Vec::new(),
-            difficulty: 1,
-            page_roots: std::collections::BTreeMap::new(),
-        });
-    }
-}
-
 #[test]
 fn test_genesis_chain_id() {
     let main = chain::Chain::genesis();
@@ -93,7 +65,11 @@ fn test_difficulty_retargets_every_interval() {
     let _tmp = setup_test_dir("retarget");
     reset_testnet();
     let mut chain = chain::Chain::genesis();
-    push_synthetic_headers(&mut chain, chain::DIFFICULTY_ADJUSTMENT_INTERVAL + 2);
+    push_synthetic_headers(
+        &mut chain,
+        chain::DIFFICULTY_ADJUSTMENT_INTERVAL + 2,
+        chain::TARGET_BLOCK_TIME_SECS,
+    );
     assert_eq!(
         chain.difficulty_for_height(chain::DIFFICULTY_ADJUSTMENT_INTERVAL + 1),
         1
@@ -107,8 +83,7 @@ fn test_median_timestamp() {
     reset_testnet();
     let mut chain = chain::Chain::genesis();
     for h in 1..=11 {
-        let mut b = mine_block_at(&chain, h, h * 100, [1u8; 32], 1, vec![]);
-        b.time = h * 100;
+        let b = mine_block_at(&chain, h, h * 100, [1u8; 32], 1, vec![]);
         chain.apply(b).unwrap();
     }
     assert_eq!(chain.median_timestamp(), 600);
@@ -134,8 +109,6 @@ fn test_time_drift_past() {
     let b1 = mine_block_at(&chain, 1, 1_000_000, [1u8; 32], 1, vec![]);
     chain.apply(b1).unwrap();
     // A timestamp below the parent time violates the median-time rule.
-    let mut b2 = mine_block_at(&chain, 2, 999_999, [1u8; 32], 1, vec![]);
-    b2.time = 999_999;
-    let b2 = chain.prepare_block(b2);
+    let b2 = mine_block_at(&chain, 2, 999_999, [1u8; 32], 1, vec![]);
     assert!(!chain.validate_block(&b2));
 }

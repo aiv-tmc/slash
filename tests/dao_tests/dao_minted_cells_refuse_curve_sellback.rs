@@ -186,19 +186,22 @@ fn dao_minted_cells_refuse_curve_sellback() {
 
     // Control: cells issued by ordinary mining on a pristine page carry
     // no provenance, so a regular sell-back to the treasury passes the
-    // engine. The control range starts on page 5 (base 5 * 65 536), far
-    // outside the minted span and any other owner range: the locked cell
-    // sits on page 0 and the funded range (s, e) lies entirely below
-    // offset 65 536. The balance assert proves every mint landed — mine
-    // returns unit, so a silent no-op would otherwise hide here and
-    // masquerade as an engine refusal downstream.
+    // engine. The control uses a real keypair: the degenerate
+    // address-equals-secret pair the lock section used would fail
+    // signature verification, because the public key is the derived
+    // Edwards point, never the raw secret bytes. The range starts on
+    // page 5 (base 5 * 65 536), far outside the minted span and every
+    // other owner range, and the balance assert proves every mint
+    // landed — mine returns unit, so a silent no-op would otherwise
+    // hide here and masquerade as an engine refusal downstream.
+    let (control_sk, control_pk) = slash::crypto::generate_keypair();
     let control_base = 5 * 65_536;
     for cell in control_base..control_base + 50 {
-        state.mine(cell, holder, 0);
+        state.mine(cell, control_pk, 0);
     }
     assert_eq!(
-        state.balance(holder),
-        1 + 50,
+        state.balance(control_pk),
+        50,
         "control setup: every mint landed on the pristine page"
     );
     assert!(!state.dao.minted.contains(control_base, control_base + 50));
@@ -218,22 +221,22 @@ fn dao_minted_cells_refuse_curve_sellback() {
         Output {
             start: control_base + 5,
             end: control_base + 50,
-            to: holder,
+            to: control_pk,
             lock: None,
         },
     ];
     let clean_hash = slash::chain::Chain::tx_signature_hash(
-        &holder,
+        &control_pk,
         &[(control_base, control_base + 50)],
         &clean_outputs,
         slash::chain::TESTNET_ID.as_bytes(),
         0,
         &None,
     );
-    let clean_sig = slash::crypto::sign(&[5u8; 32], &clean_hash);
+    let clean_sig = slash::crypto::sign(&control_sk, &clean_hash);
     assert!(
         state.tx(
-            holder,
+            control_pk,
             &[(control_base, control_base + 50)],
             &clean_outputs,
             &clean_sig,

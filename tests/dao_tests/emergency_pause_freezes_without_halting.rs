@@ -114,6 +114,18 @@ fn emergency_pause_freezes_without_halting() {
         .expect("the chain keeps moving under the pause");
     assert_eq!(chain.state.balance([7u8; 32]), miner_before + 500 + 1);
 
+    // Weight decays against the snapshot horizon: a lock counts toward
+    // the quorum denominator only while its expiry reaches
+    // snapshot_height + DAO_LOCK_MIN, and the pause consumed several
+    // blocks of that runway. Re-lock the cell for a farther expiry —
+    // what a real holder does to keep stake — so the resume proposal
+    // opens with a non-zero denominator; a zero denominator fails the
+    // quorum by construction, which is exactly the no-weight case.
+    chain
+        .state
+        .locks
+        .insert(2_000, chain.tip_height() + 1 + DAO_LOCK_MIN + DAO_LOCK_MIN);
+
     // EmergencyResume lifts the freeze before the scheduled expiry, and
     // the same class is admissible again. The resume submission is the
     // lifeline: it is the one class admitted while the freeze is live.
@@ -150,9 +162,6 @@ fn emergency_pause_freezes_without_halting() {
     }
     let b = mine_next_block(&chain, [7u8; 32], vec![]);
     chain.apply(b).unwrap();
-    // The resume proposal must have executed at its scheduled height:
-    // this assert separates a close-time failure from an execute-time
-    // failure before the flag check below.
     assert_eq!(
         chain.state.dao.proposals[&resume_id].status,
         ProposalStatus::Executed,

@@ -14,6 +14,8 @@ fn test_duplicate_block_rejected() {
     let miner = [4u8; 32];
     let b1 = mine_next_block(&chain, miner, vec![]);
     chain.apply(b1.clone()).unwrap();
+    // Re-applying an already-applied block is a structural duplicate and
+    // must be refused.
     assert!(chain.apply(b1).is_err());
 }
 
@@ -26,12 +28,17 @@ fn test_orphan_waits_for_parent() {
     let b1 = mine_next_block(&chain, miner, vec![]);
     let h1 = b1.height;
     chain.apply(b1).unwrap();
-    // Construct a child at h1 + 2 with no known parent at h1 + 1.
-    let mut b3 = mine_block_at(&chain, h1 + 2, h1 + 2, miner, 1, vec![]);
+    // Construct a child at h1 + 2 with no known parent at h1 + 1. The
+    // unchecked builder is required here: the height deliberately skips
+    // a slot, so the contiguity assertion of the checked builder would
+    // reject the template before the test ever reaches the chain.
+    let mut b3 = mine_block_at_unchecked(&chain, h1 + 2, h1 + 2, miner, 1, vec![]);
     b3.prev = [0xAA; 32];
     // Re-grind for the rewritten parent (the proof input commits to it).
     grind_nonce(&chain, &mut b3);
     let b3 = chain.prepare_block(b3);
+    // The parent is unknown, so application fails and the block parks in
+    // the orphan pool instead.
     assert!(chain.apply(b3).is_err());
     // A block at h1 + 1 with a known parent applies and links.
     let b2 = mine_block_at(&chain, h1 + 1, h1 + 1, miner, 1, vec![]);
@@ -51,8 +58,12 @@ fn test_checkpoint_rejects_divergence() {
     chain.checkpoints.insert(h, hash);
     let b2 = mine_next_block(&chain, miner, vec![]);
     assert!(chain.apply(b2).is_ok());
-    // A fork at the checkpointed height with a different hash must be rejected.
-    let mut alt = mine_block_at(&chain, h, h, miner, 1, vec![]);
+    // A fork at the checkpointed height with a different hash must be
+    // rejected. The unchecked builder is required here: the template
+    // targets a height behind the tip, which the checked builder's
+    // contiguity assertion would refuse before the checkpoint logic is
+    // ever exercised.
+    let mut alt = mine_block_at_unchecked(&chain, h, h, miner, 1, vec![]);
     alt.prev = [0xBB; 32];
     grind_nonce(&chain, &mut alt);
     let alt = chain.prepare_block(alt);
