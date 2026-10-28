@@ -3,92 +3,158 @@ name: Release
 on:
   push:
     tags:
-      - 'v*'
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build (e.g. v0.5.1)"
+        required: true
 
 permissions:
   contents: write
+  id-token: write
+  packages: write
+  attestations: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  build:
-    name: Build Release Binaries
-    strategy:
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-          - target: x86_64-apple-darwin
-            os: macos-latest
-          - target: aarch64-apple-darwin
-            os: macos-latest
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-    runs-on: ${{ matrix.os }}
+  verify:
+    name: pre-release gates
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Install system dependencies (Ubuntu)
-        if: matrix.os == 'ubuntu-latest'
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.87.0
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: System dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential cmake libssl-dev pkg-config
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --all-features --locked -- -D warnings
+      - run: cargo test --lib --locked
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+  build:
+    name: build ${{ matrix.target }}
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu,  os: ubuntu-latest,  suffix: x86_64-linux }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-latest,  suffix: aarch64-linux, cross: true }
+          - { target: x86_64-apple-darwin,       os: macos-14,       suffix: x86_64-darwin }
+          - { target: aarch64-apple-darwin,      os: macos-14,       suffix: aarch64-darwin }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.87.0
         with:
           targets: ${{ matrix.target }}
-
-      - name: Cache cargo
-        uses: actions/cache@v4
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }}
-
-      - name: Package binary (Unix)
-        if: matrix.os != 'windows-latest'
+          shared-key: slash-release
+      - name: System dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake libssl-dev pkg-config
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            sudo apt-get install -y gcc-aarch64-linux-gnu
+          fi
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package
         run: |
           mkdir -p dist
-          cp target/${{ matrix.target }}/release/slash-node dist/slash-node-${{ matrix.target }}
-          cp target/${{ matrix.target }}/release/slash-cli dist/slash-cli-${{ matrix.target }} || true
-          tar -czf dist/slash-${{ matrix.target }}.tar.gz -C dist .
-
-      - name: Package binary (Windows)
-        if: matrix.os == 'windows-latest'
+          BIN=target/${{ matrix.target }}/release/slash-node
+          tar -czf dist/slash-node-${{ matrix.suffix }}.tar.gz -C $(dirname $BIN) slash-node
+      - name: Checksums
         run: |
-          mkdir dist
-          copy target\\${{ matrix.target }}\\release\\slash-node.exe dist\\slash-node-${{ matrix.target }}.exe
-          copy target\\${{ matrix.target }}\\release\\slash-cli.exe dist\\slash-cli-${{ matrix.target }}.exe || true
-          Compress-Archive -Path dist\\* -DestinationPath dist\\slash-${{ matrix.target }}.zip
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+          cd dist
+          sha256sum slash-node-${{ matrix.suffix }}.tar.gz > slash-node-${{ matrix.suffix }}.tar.gz.sha256
+      - uses: actions/upload-artifact@v4
         with:
-          name: slash-${{ matrix.target }}
-          path: dist/slash-${{ matrix.target }}.*
+          name: slash-${{ matrix.suffix }}
+          path: dist/*
 
-  release:
-    name: Create GitHub Release
-    needs: build
+  sbom:
+    name: SBOM
+    needs: verify
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/checkout@v4
+      - uses: anchore/sbom-action@v0
         with:
-          path: artifacts
+          format: spdx-json
+          output-file: sbom.spdx.json
 
-      - name: Create Release
+  release:
+    name: publish GitHub release
+    needs: [build, sbom]
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Cosign sign (keyless)
+        uses: sigstore/cosign-installer@v3
+      - run: |
+          cosign sign-blob --yes \
+            --output-signature slash-release.sig \
+            dist/slash-node-x86_64-linux.tar.gz
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: dist/*.tar.gz
+      - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/**/*
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256
+            dist/slash-release.sig
+            sbom.spdx.json
           generate_release_notes: true
-          draft: false
-          prerelease: ${{ contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}
+          fail_on_unmatched_files: true
+
+  docker:
+    name: container image
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          platforms: linux/amd64,linux/arm64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
