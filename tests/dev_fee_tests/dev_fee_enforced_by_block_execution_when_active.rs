@@ -20,7 +20,7 @@ fn dev_fee_enforced_by_block_execution_when_active() {
     reset_testnet();
     let mut chain = treasury_genesis();
     activate_dev_fund(&mut chain);
-    chain.state.mine_fee_bps = 0;
+    chain.state_mut().mine_fee_bps = 0;
     let (sk, pk) = slash::crypto::generate_keypair();
     let inputs = fund(&mut chain, pk, 10_000);
     let non_compliant = vec![

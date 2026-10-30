@@ -19,7 +19,7 @@ fn test_replay_protection_across_networks() {
     let (alice_sk, alice) = test_keypair(1);
     let (_bob_sk, bob) = test_keypair(2);
     for i in 0..50 {
-        mine_cell_for(&mut test_chain.state, i, alice);
+        mine_cell_for(test_chain.state_mut(), i, alice);
     }
     let outputs: Vec<state::Output> = vec![
         state::Output {
@@ -45,7 +45,8 @@ fn test_replay_protection_across_networks() {
     );
     let sig = crypto::sign(&alice_sk, &hash);
     let main_chain = chain::Chain::genesis();
-    let mut main_state = main_chain.state.clone();
+    // The working copy detaches the value from the chain's shared `Arc`.
+    let mut main_state = (*main_chain.state).clone();
     for i in 0..50 {
         mine_cell_for(&mut main_state, i, alice);
     }
@@ -81,8 +82,8 @@ fn test_pristine_page_eviction() {
     let cell0 = state::PAGE_SIZE - 25;
     let cell1 = state::PAGE_SIZE;
     for i in 0..25 {
-        mine_cell_for(&mut chain.state, cell0 + i, alice);
-        mine_cell_for(&mut chain.state, cell1 + i, alice);
+        mine_cell_for(chain.state_mut(), cell0 + i, alice);
+        mine_cell_for(chain.state_mut(), cell1 + i, alice);
     }
     assert!(chain.state.pages.contains_key(&0));
     let tx = make_tx_for(

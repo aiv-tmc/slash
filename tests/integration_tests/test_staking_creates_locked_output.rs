@@ -14,7 +14,7 @@ fn test_staking_creates_locked_output() {
     let miner = [7u8; 32];
     let height = chain.tip_height() + 1;
     for i in 0..100 {
-        mine_cell_for(&mut chain.state, i, alice);
+        mine_cell_for(chain.state_mut(), i, alice);
     }
 
     // Stake cells 0..99 back to the sender, locked until height 1000,

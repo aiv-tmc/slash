@@ -21,7 +21,7 @@ fn era_nine_user_tx_at_position_zero_executes() {
     // Fund Alice with 200 treasury cells outside any block: era-9
     // transaction execution is under test here, not block production.
     for cell in 1000..1200 {
-        chain.state.mine(cell, alice_pk, 0);
+        chain.state_mut().mine(cell, alice_pk, 0);
     }
     let outputs = vec![
         Output {

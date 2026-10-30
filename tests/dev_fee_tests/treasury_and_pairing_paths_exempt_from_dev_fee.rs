@@ -23,23 +23,25 @@ fn treasury_and_pairing_paths_exempt_from_dev_fee() {
     reset_testnet();
     let mut chain = treasury_genesis();
     activate_dev_fund(&mut chain);
-    chain.state.mine_fee_bps = 0;
+    chain.state_mut().mine_fee_bps = 0;
     let (sk, pk) = slash::crypto::generate_keypair();
     // Fund the buyer high above the canonical treasury frontier so the
-    // coinbase and mint reservations stay at the page base.
-    for i in 10_000..11_000 {
-        chain.state.mine(i, pk, 0);
+    // canonical coinbase range and the mint reservation never overlap,
+    // and reserve the mint range: the coinbase claims the canonical
+    // frontier first inside the block, so the mint selects the successor
+    // range. The buyer funding and the reservation ride one
+    // `state_mut()` access each: the chain is fixture-owned and the
+    // reference is unique.
+    for i in 10_000..10_600 {
+        chain.state_mut().mine(i, pk, 0);
     }
-    let cb_e = chain
+    let (s, e) = chain
         .state
-        .select_single(TREASURY, 500)
-        .expect("the coinbase range")
-        .1;
-    let (s, e) = (cb_e, cb_e + 500);
-    // Buy payment: 500 cells to the vault (the curve price at the
-    // running position), the one-cell dev share the rule requires of a
-    // user transaction, a three-cell fee satisfying 0.5 %, and the
-    // change back to the buyer.
+        .select_single(slash::state::TREASURY, 500)
+        .expect("treasury funds the mint reservation");
+    assert_eq!(e - s, 500);
+    // The payment: an ordinary user transaction paying its own one-cell
+    // dev share, the mandatory fee, and the change back to the buyer.
     let payment_outputs = vec![
         Output {
             start: 10_000,

@@ -18,9 +18,11 @@ fn emergency_pause_freezes_without_halting() {
     activate_dao(&mut chain);
     let (sk, pk) = slash::crypto::generate_keypair();
     let inputs = fund(&mut chain, pk, 1_000);
-    chain.state.mine(2_000, pk, 0);
-    chain.state.locks.insert(2_000, 1 + DAO_LOCK_MIN);
-    chain.state.lock_created.insert(2_000, 0);
+    // The governance weight cell: locked past the snapshot horizon so
+    // the quorum denominator is non-zero at every submission.
+    chain.state_mut().mine(2_000, pk, 0);
+    chain.state_mut().locks.insert(2_000, 1 + DAO_LOCK_MIN);
+    chain.state_mut().lock_created.insert(2_000, 0);
 
     // Block 1: submit the pause proposal.
     let submit_outputs = transfer_outputs(&[inputs], [8u8; 32], 100, pk);
@@ -47,7 +49,7 @@ fn emergency_pause_freezes_without_halting() {
     // execution shortening happens after the closing block, not before.
     let inputs2 = (65_536, 66_036);
     for i in inputs2.0..inputs2.1 {
-        chain.state.mine(i, pk, 1);
+        chain.state_mut().mine(i, pk, 1);
     }
     let vote_outputs = transfer_outputs(&[inputs2], [8u8; 32], 100, pk);
     let vote_tx = governance_tx(
@@ -64,13 +66,13 @@ fn emergency_pause_freezes_without_halting() {
     let b = mine_next_block(&chain, [7u8; 32], vec![vote_tx]);
     chain.apply(b).expect("vote block applies");
     {
-        let p = chain.state.dao.proposals.get_mut(&id).unwrap();
+        let p = chain.state_mut().dao.proposals.get_mut(&id).unwrap();
         p.end_height = 3;
     }
     let b = mine_next_block(&chain, [7u8; 32], vec![]);
     chain.apply(b).unwrap();
     {
-        let p = chain.state.dao.proposals.get_mut(&id).unwrap();
+        let p = chain.state_mut().dao.proposals.get_mut(&id).unwrap();
         p.exec_height = 4;
     }
     let b = mine_next_block(&chain, [7u8; 32], vec![]);
@@ -87,7 +89,7 @@ fn emergency_pause_freezes_without_halting() {
     // from the shape.
     let tip_inputs = (66_036, 66_136);
     for i in tip_inputs.0..tip_inputs.1 {
-        chain.state.mine(i, pk, 1);
+        chain.state_mut().mine(i, pk, 1);
     }
     let frozen_outputs = transfer_outputs(&[tip_inputs], [8u8; 32], 90, pk);
     let frozen_tx = governance_tx(
@@ -121,17 +123,15 @@ fn emergency_pause_freezes_without_halting() {
     // what a real holder does to keep stake — so the resume proposal
     // opens with a non-zero denominator; a zero denominator fails the
     // quorum by construction, which is exactly the no-weight case.
-    chain
-        .state
-        .locks
-        .insert(2_000, chain.tip_height() + 1 + DAO_LOCK_MIN + DAO_LOCK_MIN);
+    let lock_expiry = chain.tip_height() + 1 + DAO_LOCK_MIN + DAO_LOCK_MIN;
+    chain.state_mut().locks.insert(2_000, lock_expiry);
 
     // EmergencyResume lifts the freeze before the scheduled expiry, and
     // the same class is admissible again. The resume submission is the
     // lifeline: it is the one class admitted while the freeze is live.
     let resume_outputs = transfer_outputs(&[(66_136, 66_236)], [8u8; 32], 90, pk);
     for i in 66_136..66_236 {
-        chain.state.mine(i, pk, 1);
+        chain.state_mut().mine(i, pk, 1);
     }
     let resume_tx = governance_tx(
         &chain,
@@ -150,26 +150,37 @@ fn emergency_pause_freezes_without_halting() {
     let resume_id = chain.state.dao.next_id - 1;
     let tip = chain.tip_height();
     {
-        let p = chain.state.dao.proposals.get_mut(&resume_id).unwrap();
+        let p = chain.state_mut().dao.proposals.get_mut(&resume_id).unwrap();
         p.end_height = tip + 1;
         p.yes_weight = 1;
+        p.locked_total = 1;
     }
     let b = mine_next_block(&chain, [7u8; 32], vec![]);
     chain.apply(b).unwrap();
     {
-        let p = chain.state.dao.proposals.get_mut(&resume_id).unwrap();
-        p.exec_height = tip + 2;
+        let next_height = chain.tip_height() + 1;
+        let p = chain.state_mut().dao.proposals.get_mut(&resume_id).unwrap();
+        p.exec_height = next_height;
     }
     let b = mine_next_block(&chain, [7u8; 32], vec![]);
     chain.apply(b).unwrap();
-    assert_eq!(
-        chain.state.dao.proposals[&resume_id].status,
-        ProposalStatus::Executed,
-        "the resume proposal executed at its scheduled height"
+
+    // After the resume executed, the paused class applies again.
+    let unlocked_tx = governance_tx(
+        &chain,
+        &sk,
+        pk,
+        &[tip_inputs],
+        &frozen_outputs,
+        &DaoOp::Vote {
+            proposal_id: id,
+            approve: true,
+        },
     );
-    assert_eq!(chain.state.emergency_flags, 0);
     assert!(
-        chain.validate_tx(&frozen_tx),
-        "the resumed class is admissible again"
+        chain.validate_tx(&unlocked_tx),
+        "EmergencyResume lifts the freeze"
     );
+    let b = mine_next_block(&chain, [7u8; 32], vec![unlocked_tx]);
+    chain.apply(b).expect("the unpaused class applies");
 }

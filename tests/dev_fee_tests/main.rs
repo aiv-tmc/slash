@@ -21,13 +21,13 @@ fn activate_dev_fund(chain: &mut Chain) {
         .expect("dev_fund deployment exists");
     d.status = DeploymentStatus::Active;
     d.activation_height = Some(0);
-    chain.state.dev_fee_bps = 1;
+    chain.state_mut().dev_fee_bps = 1;
 }
 
 /// Fund an address with `cells` contiguous cells via the test backfill.
 fn fund(chain: &mut Chain, owner: [u8; 32], cells: u64) -> (u64, u64) {
     for i in 0..cells {
-        chain.state.mine(i, owner, 0);
+        chain.state_mut().mine(i, owner, 0);
     }
     (0, cells)
 }

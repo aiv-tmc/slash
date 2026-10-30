@@ -26,7 +26,7 @@ fn test_select_single_contiguous() {
     // packed, correctly signed spend over the selected range executes.
     let (sk, owner) = test_keypair(7);
     for i in 0..100 {
-        mine_cell_for(&mut chain.state, i, owner);
+        mine_cell_for(chain.state_mut(), i, owner);
     }
     let (s, e) = chain
         .state
@@ -56,13 +56,15 @@ fn test_select_single_contiguous() {
         &None,
     );
     let sig = slash::crypto::sign(&sk, &hash);
-    assert!(chain.state.tx(
+    let height = chain.tip_height() + 1;
+    let chain_id = chain.chain_id.clone();
+    assert!(chain.state_mut().tx(
         owner,
         &[(s, e)],
         &outputs,
         &sig,
-        chain.tip_height() + 1,
-        chain.chain_id.as_bytes(),
+        height,
+        chain_id.as_bytes(),
         0,
         &None,
     ));

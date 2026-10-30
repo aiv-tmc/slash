@@ -8,8 +8,10 @@
 //! dead-code lint); the crate root re-exports them together with the
 //! `Chain` type so every submodule reaches the whole fixture namespace
 //! through one glob import. The conflicting-reorg fixtures live in
-//! `forks_conflicting_support` and reach only the module that uses them.
+//! `forks_conflicting_support` and reach the tests through one
+//! crate-visible re-export, keeping the test bodies unchanged.
 
+pub use slash::chain;
 pub use slash::chain::Chain;
 pub use slash::test_fixtures::*;
 
@@ -23,3 +25,6 @@ mod meta;
 mod multi_input;
 mod staking;
 mod transfers;
+
+pub(crate) use forks_conflicting_support::*;
+pub(crate) use slash::chain::BlockProcessResult;

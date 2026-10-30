@@ -11,7 +11,7 @@ fn test_miner_claims_accumulated_fees() {
     let (alice_sk, alice) = test_keypair(1);
     let miner = test_keypair(7).1;
     for i in 0..100 {
-        mine_cell_for(&mut chain.state, i, alice);
+        mine_cell_for(chain.state_mut(), i, alice);
     }
     let height = chain.tip_height() + 1;
     let tx = make_tx_for(
@@ -54,7 +54,7 @@ fn test_fee_claim_to_third_party_rejected() {
     let (alice_sk, alice) = test_keypair(1);
     let miner = test_keypair(7).1;
     for i in 0..100 {
-        mine_cell_for(&mut chain.state, i, alice);
+        mine_cell_for(chain.state_mut(), i, alice);
     }
     let height = chain.tip_height() + 1;
     let tx = make_tx_for(

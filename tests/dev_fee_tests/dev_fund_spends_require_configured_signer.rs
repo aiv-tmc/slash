@@ -18,7 +18,7 @@ fn dev_fund_spends_require_configured_signer() {
     // buy payment is invalid by the pairing rules, so it cannot seed a
     // test that is not about pairing.
     for cell in 0..200 {
-        chain.state.mine(cell, DEV_FUND, 0);
+        chain.state_mut().mine(cell, DEV_FUND, 0);
     }
     assert_eq!(chain.state.balance(DEV_FUND), 200);
 
@@ -52,7 +52,7 @@ fn dev_fund_spends_require_configured_signer() {
     assert!(chain.apply(block).is_err());
 
     // Signer configured: a spend signed by that key passes both paths.
-    chain.state.dev_fund_signer = dev_pk;
+    chain.state_mut().dev_fund_signer = dev_pk;
     assert!(chain.validate_tx(&spend));
     let block = mine_next_block(&chain, [7u8; 32], vec![spend]);
     chain

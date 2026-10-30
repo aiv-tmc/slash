@@ -45,7 +45,7 @@ fn test_mine_respects_locked_cells() {
     reset_testnet();
     let mut chain = chain::Chain::genesis();
     // The PoW slot must never claim a cell owned by a user.
-    chain.state.mine(500, [9u8; 32], 0);
+    chain.state_mut().mine(500, [9u8; 32], 0);
     let b = mine_next_block(&chain, [1u8; 32], vec![]);
     chain.apply(b).unwrap();
     assert_eq!(chain.state.balance([9u8; 32]), 1);

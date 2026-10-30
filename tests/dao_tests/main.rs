@@ -26,7 +26,7 @@ fn activate_dao(chain: &mut Chain) {
 /// Fund an address with `cells` contiguous cells.
 fn fund(chain: &mut Chain, owner: [u8; 32], cells: u64) -> (u64, u64) {
     for i in 0..cells {
-        chain.state.mine(i, owner, 0);
+        chain.state_mut().mine(i, owner, 0);
     }
     (0, cells)
 }

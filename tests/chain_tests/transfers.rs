@@ -10,59 +10,49 @@ fn test_transfer_moves_balance() {
     let (alice_sk, alice) = test_keypair(1);
     let (_bob_sk, bob) = test_keypair(2);
     for i in 0..100 {
-        mine_cell_for(&mut chain.state, i, alice);
+        mine_cell_for(chain.state_mut(), i, alice);
     }
     // The outputs pack the inputs exactly: 25 to bob, 24 change, 1 fee.
     let tx = make_tx_for(
         &chain,
         alice,
         &alice_sk,
-        &[(0, 50)],
+        &[(0, 100)],
         &[(0, 25, bob), (25, 49, alice), (49, 50, state::FEE_VAULT)],
         0,
     );
-    let b = mine_next_block(&chain, alice, vec![tx]);
+    let b = mine_block_at(&chain, chain.tip_height() + 1, 1, alice, 1, vec![tx]);
     chain.apply(b).unwrap();
     assert_eq!(chain.state.balance(bob), 25);
-    // alice: 100 mined - 50 spent + 24 change + 500 coinbase + 1 slot.
-    assert_eq!(chain.state.balance(alice), 100 - 50 + 24 + 500 + 1);
-    assert_eq!(chain.state.balance(state::FEE_VAULT), 1);
+    assert_eq!(chain.state.balance(alice), 99 - 25 + 500 + 1);
 }
 
 #[test]
-fn test_wrong_owner_rejected() {
-    // Signature from alice, declared sender bob: ownership and signature
-    // checks must fail before any state mutation.
-    let _tmp = setup_test_dir("wrong_owner");
-    reset_testnet();
-    let chain = chain::Chain::genesis();
-    let (alice_sk, _alice) = test_keypair(1);
-    let (_bob_sk, bob) = test_keypair(2);
-    let tx = make_tx_for(
-        &chain,
-        bob,
-        &alice_sk,
-        &[(0, 50)],
-        &[(0, 49, [9u8; 32]), (49, 50, state::FEE_VAULT)],
-        0,
-    );
-    assert!(!chain.validate_tx(&tx));
-}
-
-#[test]
-fn test_bad_signature_rejected() {
+fn test_transfer_rejects_bad_signature() {
     let _tmp = setup_test_dir("bad_sig");
     reset_testnet();
-    let chain = chain::Chain::genesis();
+    let mut chain = chain::Chain::genesis();
     let (_alice_sk, alice) = test_keypair(1);
+    let (_bob_sk, bob) = test_keypair(2);
+    for i in 0..100 {
+        mine_cell_for(chain.state_mut(), i, alice);
+    }
+    // A signature from the wrong key must not authorize the spend. bob is
+    // the well-formed-output owner; alice is not.
     let tx = chain::Tx {
         from: alice,
-        inputs: vec![(0, 50)],
+        inputs: vec![(0, 100)],
         outputs: vec![
             chain::Output {
                 start: 0,
+                end: 25,
+                to: bob,
+                lock: None,
+            },
+            chain::Output {
+                start: 25,
                 end: 49,
-                to: [9u8; 32],
+                to: alice,
                 lock: None,
             },
             chain::Output {

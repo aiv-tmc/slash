@@ -18,9 +18,9 @@ fn dev_fund_spends_capped_at_one_per_block() {
     reset_testnet();
     let mut chain = treasury_genesis();
     let (dev_sk, dev_pk) = slash::crypto::generate_keypair();
-    chain.state.dev_fund_signer = dev_pk;
+    chain.state_mut().dev_fund_signer = dev_pk;
     for cell in 0..200 {
-        chain.state.mine(cell, DEV_FUND, 0);
+        chain.state_mut().mine(cell, DEV_FUND, 0);
     }
     assert_eq!(chain.state.balance(DEV_FUND), 200);
 

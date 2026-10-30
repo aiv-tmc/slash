@@ -10,6 +10,36 @@ pub(crate) const STAGE_BUILD: &str = "[forks_conflicting:build-fork]";
 pub(crate) const STAGE_ADOPT: &str = "[forks_conflicting:adoption]";
 pub(crate) const STAGE_ASSERT: &str = "[forks_conflicting:assertions]";
 
+/// Serialize one block list into the canonical fingerprint compared by the
+/// conflict tests. Two block lists are identical precisely when their
+/// bincode encodings agree byte for byte.
+pub(crate) fn blocks_fingerprint(blocks: &[chain::Block]) -> Vec<u8> {
+    bincode::serialize(blocks).expect("block lists serialize")
+}
+
+/// Dump the balances the conflicting-reorg tests reason about, tagged
+/// with the stage, so a failure output alone localizes where a divergence
+/// appears.
+pub(crate) fn dump_balances(
+    chain: &chain::Chain,
+    tag: &str,
+    miner_a: [u8; 32],
+    miner_b: [u8; 32],
+    bob: [u8; 32],
+    carol: [u8; 32],
+) {
+    eprintln!(
+        "{tag} tip={} miner_a={} miner_b={} bob={} carol={} alice={} vault={}",
+        chain.tip_height(),
+        chain.state.balance(miner_a),
+        chain.state.balance(miner_b),
+        chain.state.balance(bob),
+        chain.state.balance(carol),
+        chain.state.balance(alice_pk()),
+        chain.state.balance(slash::state::FEE_VAULT),
+    );
+}
+
 /// Deterministic fixture secret for Alice; the public half derives
 /// through the ordinary Ed25519 key derivation so signatures verify
 /// through the consensus path.
@@ -58,35 +88,6 @@ pub(crate) fn fund_alice(state: &mut slash::state::State) {
     }
 }
 
-/// The serialized form of the retained block window, used to compare
-/// chain contents exactly: two block lists are identical precisely when
-/// their canonical serializations agree byte for byte.
-pub(crate) fn blocks_fingerprint(blocks: &[chain::Block]) -> Vec<u8> {
-    bincode::serialize(blocks).expect("block lists serialize")
-}
-
-/// Dump every balance the test reasons about, tagged with the stage, so
-/// a failure output alone localizes where a divergence appears.
-pub(crate) fn dump_balances(
-    chain: &chain::Chain,
-    tag: &str,
-    miner_a: [u8; 32],
-    miner_b: [u8; 32],
-    bob: [u8; 32],
-    carol: [u8; 32],
-) {
-    eprintln!(
-        "{tag} tip={} miner_a={} miner_b={} bob={} carol={} alice={} vault={}",
-        chain.tip_height(),
-        chain.state.balance(miner_a),
-        chain.state.balance(miner_b),
-        chain.state.balance(bob),
-        chain.state.balance(carol),
-        chain.state.balance(alice_pk()),
-        chain.state.balance(slash::state::FEE_VAULT),
-    );
-}
-
 /// Build one fork block at `height` on top of `prev` against the fork
 /// base state `scratch`, mirroring the heavier-fork reorg test: the
 /// template is mined against the main chain, its height and parent are
@@ -118,8 +119,10 @@ pub(crate) fn build_fork_block(
     b.txs = std::iter::once(coinbase).chain(txs).collect();
     // Install the fork base state so the nonce ownership check and
     // preparation execute against exactly the state the fork validation
-    // replays, then restore the tip state.
-    let saved = std::mem::replace(&mut chain.state, scratch.clone());
+    // replays, then restore the tip state. The installation re-wraps
+    // the scratch copy behind a fresh `Arc` for the duration of the
+    // preparation and restores the shared original afterwards.
+    let saved = std::mem::replace(&mut chain.state, std::sync::Arc::new(scratch.clone()));
     grind_nonce(chain, &mut b);
     if let Some((s, e)) = coinbase_range {
         assert!(
@@ -144,4 +147,21 @@ pub(crate) fn build_fork_block(
             .unwrap_or_else(|_| panic!("{stage} build: fork block does not execute at {height}"));
     }
     b
+}
+
+/// Mine one block on the current tip and apply it immediately. The helper
+/// returns the applied block so callers can retain the exact branch tip.
+pub(crate) fn mine_tip_block(chain: &mut chain::Chain, miner: [u8; 32]) -> chain::Block {
+    let block = mine_next_block(chain, miner, vec![]);
+    chain
+        .apply(block.clone())
+        .expect("mined tip block must apply");
+    block
+}
+
+/// Clone the retained state snapshot at height 1. The conflicting-reorg
+/// tests build both branches from this shared point so neither branch
+/// observes the other's spends while fixture blocks are being prepared.
+pub(crate) fn b1_state(chain: &chain::Chain) -> slash::state::State {
+    (*chain.state_history[&1]).clone()
 }

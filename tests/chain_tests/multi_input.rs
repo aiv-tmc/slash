@@ -16,7 +16,7 @@ fn test_double_spend_same_block_rejected() {
     let mut chain = chain::Chain::genesis();
     let (alice_sk, alice) = test_keypair(1);
     for i in 0..50 {
-        mine_cell_for(&mut chain.state, i, alice);
+        mine_cell_for(chain.state_mut(), i, alice);
     }
     let height = chain.tip_height() + 1;
     let tx1 = make_tx_for(
@@ -46,7 +46,7 @@ fn test_output_gap_rejected() {
     let mut chain = chain::Chain::genesis();
     let (alice_sk, alice) = test_keypair(1);
     for i in 0..100 {
-        mine_cell_for(&mut chain.state, i, alice);
+        mine_cell_for(chain.state_mut(), i, alice);
     }
     let height = chain.tip_height() + 1;
     // Outputs must pack the inputs exactly: the gap between 40 and 41
@@ -74,7 +74,7 @@ fn test_unbalanced_pages_rejected() {
     let mut chain = chain::Chain::genesis();
     let (alice_sk, alice) = test_keypair(1);
     for i in 0..50 {
-        mine_cell_for(&mut chain.state, i, alice);
+        mine_cell_for(chain.state_mut(), i, alice);
     }
     let height = chain.tip_height() + 1;
     // The declared outputs total 40 cells against 50 cells of inputs.
@@ -99,8 +99,8 @@ fn test_cross_page_transfer() {
     let cell0 = state::PAGE_SIZE - 25;
     let cell1 = state::PAGE_SIZE;
     for i in 0..25 {
-        mine_cell_for(&mut chain.state, cell0 + i, alice);
-        mine_cell_for(&mut chain.state, cell1 + i, alice);
+        mine_cell_for(chain.state_mut(), cell0 + i, alice);
+        mine_cell_for(chain.state_mut(), cell1 + i, alice);
     }
     let height = chain.tip_height() + 1;
     // The two inputs are adjacent (cell0 + 25 == cell1), so the outputs
@@ -139,7 +139,7 @@ fn test_consolidate_disjoint_ranges() {
     let (alice_sk, alice) = test_keypair(1);
     let miner = test_keypair(7).1;
     for i in 0..100 {
-        mine_cell_for(&mut chain.state, i, alice);
+        mine_cell_for(chain.state_mut(), i, alice);
     }
     let height = chain.tip_height() + 1;
     let tx = make_tx_for(
