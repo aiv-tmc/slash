@@ -64,7 +64,9 @@ fn test_treasury_payout_above_sell_price_rejected() {
         &chain.chain_id,
     );
     // sell_price(100, 100) is 98; refunding 99 overpays the seller.
-    let mut sim = chain.state.clone();
+    // The scratch copy detaches the value from the chain's shared `Arc`,
+    // so the simulated vault funding never touches the live state.
+    let mut sim = (*chain.state).clone();
     sim.mine(0, state::TREASURY_VAULT, 2);
     sim.mine(1, state::TREASURY_VAULT, 2);
     let payout = payout_tx_on(&sim, &chain.chain_id, 99, seller);
@@ -135,7 +137,9 @@ fn test_treasury_double_payout_against_single_sell_rejected() {
     let payout_one = payout_tx_on(&chain.state, &chain.chain_id, 98, seller);
     // Fund a second vault input so the second payout is structurally
     // spendable; it must still be rejected for lack of a pending sell.
-    let mut sim = chain.state.clone();
+    // The scratch copy detaches the value from the chain's shared `Arc`,
+    // so the simulated vault funding never touches the live state.
+    let mut sim = (*chain.state).clone();
     sim.mine(500, state::TREASURY_VAULT, 2);
     sim.mine(501, state::TREASURY_VAULT, 2);
     let payout_two = payout_tx_on(&sim, &chain.chain_id, 98, seller);

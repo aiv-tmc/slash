@@ -15,9 +15,13 @@ fn test_reorg_rejected_without_history() {
     reset_testnet();
     let (mut chain, main_miner) = chain_with_blocks(5);
     let tip_hash = chain.tip_hash();
-    let state4 = chain.state_history[&4].clone();
+    // The history entries are shared snapshots; the working copy
+    // detaches the value so the fork simulation can advance it.
+    let state4 = (*chain.state_history[&4]).clone();
 
     // Adopt the fail-closed posture: drop all history except the tip state.
+    // `chain.state.clone()` shares the tip state's `Arc`, so the tip
+    // entry costs a reference-count bump, not a copy.
     chain.state_history.clear();
     chain.state_history.insert(5, chain.state.clone());
 

@@ -104,9 +104,10 @@ fn fork_block(
 /// block, so the header commits to the post-block state of that fork
 /// point. The node's own prepare path cannot serve here — it executes
 /// against the tip state, where a fork block's coinbase inputs are
-/// already spent.
+/// already spent. The installed state re-wraps the value behind a fresh
+/// `Arc` for the scratch chain's exclusive use.
 fn rooted(chain: &Chain, state: &State, block: Block) -> Block {
     let mut scratch = chain.clone();
-    scratch.state = state.clone();
+    scratch.state = std::sync::Arc::new(state.clone());
     scratch.prepare_block(block)
 }

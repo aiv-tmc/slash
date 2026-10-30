@@ -19,7 +19,7 @@ fn test_dos_spam_tx_with_zero_fee_rejected() {
     // payment is invalid by the pairing rules, so it cannot seed a test
     // that is not about pairing.
     for i in 0..50 {
-        chain.state.mine(i, alice, 0);
+        chain.state_mut().mine(i, alice, 0);
     }
 
     // A transaction with no fee-vault output is refused by both

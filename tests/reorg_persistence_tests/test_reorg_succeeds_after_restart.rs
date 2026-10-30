@@ -17,7 +17,10 @@ fn test_reorg_succeeds_after_restart() {
     let mut loaded = slash::load_pruned();
     assert_eq!(loaded.state_history.len(), 6);
 
-    let state4 = loaded.state_history[&4].clone();
+    // The history entries are shared snapshots; the working copy
+    // detaches the value so the fork simulation can advance it through
+    // mint_slot and the coinbase mint below.
+    let state4 = (*loaded.state_history[&4]).clone();
     let fork_miner = [9u8; 32];
     let hash4 = loaded.block_hash(&loaded.blocks[3]);
     let a = rooted(

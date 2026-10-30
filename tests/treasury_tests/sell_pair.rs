@@ -112,7 +112,9 @@ fn test_treasury_sell_pair_insufficient_vault_rejected() {
         ],
         &chain.chain_id,
     );
-    let mut sim = chain.state.clone();
+    // The scratch copy detaches the value from the chain's shared `Arc`,
+    // so the simulated vault funding never touches the live state.
+    let mut sim = (*chain.state).clone();
     sim.mine(0, state::TREASURY_VAULT, 2);
     sim.mine(1, state::TREASURY_VAULT, 2);
     let payout = payout_tx_on(&sim, &chain.chain_id, 98, seller);

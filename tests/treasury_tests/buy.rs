@@ -148,7 +148,9 @@ fn test_treasury_double_mint_against_single_payment_rejected() {
     );
     let mint1 = mint_tx(&chain, 50, buyer);
     // The second mint uses inputs canonical on the state after the first mint.
-    let mut sim = chain.state.clone();
+    // The scratch copy detaches the value from the chain's shared `Arc`,
+    // so the simulated first mint never touches the live state.
+    let mut sim = (*chain.state).clone();
     sim.mint(
         &mint1.inputs,
         &mint1

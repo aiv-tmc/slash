@@ -22,7 +22,7 @@ fn test_mempool_rate_limiting_simulated() {
     let ranges: Vec<(u64, u64)> = (0..5u64).map(|i| (i * 200, i * 200 + 200)).collect();
     for &(s, e) in &ranges {
         for cell in s..e {
-            chain.state.mine(cell, alice, 0);
+            chain.state_mut().mine(cell, alice, 0);
         }
     }
 

@@ -14,7 +14,10 @@ fn test_reorg_succeeds_with_history() {
     let _tmp = setup_test_dir("reorg_success");
     reset_testnet();
     let (mut chain, _main_miner) = chain_with_blocks(5);
-    let state4 = chain.state_history[&4].clone();
+    // The history entries are shared snapshots; the working copy
+    // detaches the value so the fork simulation can advance it through
+    // mint_slot and the coinbase mint below.
+    let state4 = (*chain.state_history[&4]).clone();
     let fork_miner = [9u8; 32];
     let hash4 = chain.block_hash(&chain.blocks[3]);
     let a = rooted(

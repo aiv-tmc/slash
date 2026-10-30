@@ -12,7 +12,7 @@ fn test_storage_save_and_load_state() {
     let mut chain = chain::Chain::genesis();
     let owner = [1u8; 32];
 
-    chain.state.mine(100, owner, 0);
+    chain.state_mut().mine(100, owner, 0);
     storage::save(&chain.state).unwrap();
 
     let loaded = storage::load().unwrap();
@@ -54,7 +54,7 @@ fn test_snapshot_save_and_load() {
     let mut chain = chain::Chain::genesis();
     let owner = [1u8; 32];
 
-    chain.state.mine(50, owner, 0);
+    chain.state_mut().mine(50, owner, 0);
     storage::save_snapshot(&chain.state, 10).unwrap();
 
     let (height, loaded) = storage::load_latest_snapshot(10).unwrap();
@@ -202,6 +202,6 @@ fn test_locks_pruned_after_expiry() {
         chain.apply(b).unwrap();
     }
     let tip = chain.blocks.len() as u64 + chain.base_height - 1;
-    chain.state.prune_locks(tip);
+    chain.state_mut().prune_locks(tip);
     assert!(chain.state.locks.is_empty());
 }

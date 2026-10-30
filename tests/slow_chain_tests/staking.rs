@@ -16,7 +16,7 @@ fn test_stake_spendable_at_lock_height() {
     let mut chain = chain::Chain::genesis();
     let (alice_sk, alice) = test_keypair(1);
     for i in 0..100 {
-        mine_cell_for(&mut chain.state, i, alice);
+        mine_cell_for(chain.state_mut(), i, alice);
     }
     let height = chain.tip_height() + 1;
     let tx = make_tx_at(

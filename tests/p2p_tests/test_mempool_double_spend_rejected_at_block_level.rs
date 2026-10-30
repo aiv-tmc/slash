@@ -22,7 +22,7 @@ fn test_mempool_double_spend_rejected_at_block_level() {
     // that is not about pairing. Both transactions below are individually
     // well-formed and correctly signed.
     for i in 0..50 {
-        chain.state.mine(i, alice, 0);
+        chain.state_mut().mine(i, alice, 0);
     }
 
     let tx1 = make_tx(
