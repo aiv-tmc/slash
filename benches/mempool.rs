@@ -18,7 +18,7 @@ pub fn bench_mempool_validation_10k(c: &mut Criterion) {
     // the signer key must own the mined input range.
     let (sk, owner) = slash::crypto::generate_keypair();
     for i in 0..60 {
-        chain.state.mine(i, owner, 0);
+        chain.state_mut().mine(i, owner, 0);
     }
 
     let inputs = vec![(0u64, 60u64)];

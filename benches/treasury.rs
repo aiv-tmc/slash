@@ -20,7 +20,7 @@ pub fn bench_treasury_pairing_scan(c: &mut Criterion) {
 
     let mut chain = slash::chain::Chain::genesis();
     let (signer_sk, signer_pk) = slash::crypto::generate_keypair();
-    chain.state.treasury_signer = signer_pk;
+    chain.state_mut().treasury_signer = signer_pk;
     let chain_id = slash::chain::MAINNET_ID.as_bytes().to_vec();
     let miner = [9u8; 32];
 
@@ -32,7 +32,7 @@ pub fn bench_treasury_pairing_scan(c: &mut Criterion) {
         let (buyer_sk, buyer_pk) = slash::crypto::generate_keypair();
         let base = 1_000_000u64 + i as u64 * 200;
         for cell in base..base + 120 {
-            chain.state.mine(cell, buyer_pk, 0);
+            chain.state_mut().mine(cell, buyer_pk, 0);
         }
         buyer_keys.push((buyer_sk, buyer_pk));
     }
@@ -40,7 +40,7 @@ pub fn bench_treasury_pairing_scan(c: &mut Criterion) {
     // The coinbase is part of the block execution, so the scratch state
     // must absorb it before any canonical mint inputs are computed.
     let coinbase = slash::chain::Chain::build_coinbase(&chain.state, miner, 1, 0).unwrap();
-    let mut scratch = chain.state.clone();
+    let mut scratch = chain.state.as_ref().clone();
     // Mirror the PoW slot mint before the coinbase: execute_block_state
     // mints the slot first, and because canonical selection scans the dirty
     // page map, the slot's page enters the selection order ahead of the
@@ -179,7 +179,7 @@ pub fn bench_treasury_pairing_scan(c: &mut Criterion) {
         // fixture. Every consensus branch of execute_block_txs is mirrored
         // here (slot mint, coinbase mint, ordinary transfer, treasury mint),
         // so the printed stage pinpoints the first divergence.
-        let mut temp = chain.state.clone();
+        let mut temp = chain.state.as_ref().clone();
         temp.mine(500_000, miner, 1);
         let cb = &block.txs[0];
         let coinbase_ok = temp.mint(&cb.inputs, &engine_outputs(&cb.outputs), block.height);

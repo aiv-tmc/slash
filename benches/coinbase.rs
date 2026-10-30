@@ -17,7 +17,7 @@ pub fn bench_coinbase_preparation(c: &mut Criterion) {
     // canonical treasury selection has real work to do instead of reading
     // the pristine shortcut.
     for i in 0..10_000u64 {
-        chain.state.mine(i, miner, 0);
+        chain.state_mut().mine(i, miner, 0);
     }
 
     c.bench_function("build_coinbase", |b| {
