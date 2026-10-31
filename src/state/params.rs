@@ -39,9 +39,16 @@ pub const MIN_FEE_DENOMINATOR: u64 = 200;
 /// The global bound on simultaneously locked cells.
 pub const MAX_LOCKED_CELLS: u64 = 1_000_000;
 
-/// The page id (index) of a global cell.
+/// The page id (index) of a global cell. Consensus validation bounds all
+/// transaction ranges to the ledger supply before state code runs. An
+/// out-of-ledger cell maps to the one-past-the-end sentinel page instead
+/// of wrapping through a truncated conversion, which lets read-only
+/// helpers return an empty result without silently aliasing a real page.
 pub fn page_id(cell: u64) -> u16 {
-    (cell / PAGE_SIZE) as u16
+    if cell >= N {
+        return page_count();
+    }
+    u16::try_from(cell / PAGE_SIZE).expect("ledger page count fits in u16")
 }
 
 /// The page-local offset of a global cell.
@@ -49,13 +56,17 @@ pub fn page_offset(cell: u64) -> u64 {
     cell % PAGE_SIZE
 }
 
-/// The number of cells a page holds (the final page is short).
+/// The number of cells a page holds (the final page is short). The
+/// sentinel page past the end holds no cells and reports size zero.
 pub fn page_size(page_id: u16) -> u64 {
-    let start = page_id as u64 * PAGE_SIZE;
-    PAGE_SIZE.min(N.saturating_sub(start))
+    let start = u64::from(page_id) * PAGE_SIZE;
+    if start >= N {
+        return 0;
+    }
+    PAGE_SIZE.min(N - start)
 }
 
 /// The number of pages in the ledger.
 pub fn page_count() -> u16 {
-    PAGE_COUNT as u16
+    u16::try_from(PAGE_COUNT).expect("ledger page count fits in u16")
 }

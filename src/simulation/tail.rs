@@ -76,7 +76,9 @@ pub fn simulate_fee_only_tail(config: &SimulationConfig, run_blocks: u64) -> boo
     let (user_sk, user) = crate::crypto::generate_keypair();
     let mut range = (65_536u64, 131_072u64);
     for cell in range.0..range.1 {
-        chain.state.mine(cell, user, 1);
+        // The simulation chain is locally owned with a unique reference,
+        // so the seeding write goes through `Arc::make_mut` in place.
+        std::sync::Arc::make_mut(&mut chain.state).mine(cell, user, 1);
     }
     // The mandatory fee is ceil(total_out / 200): a truncated division
     // pays one cell short whenever the width is not a multiple of 200,
@@ -122,8 +124,10 @@ pub fn simulate_fee_only_tail(config: &SimulationConfig, run_blocks: u64) -> boo
         // when the claims execute — after the fee lands. Stage the
         // transaction on a scratch copy and sweep the scratch vault, so
         // the claims cover the freshly paid fee together with every
-        // earlier one and the vault ends the block empty.
-        let mut scratch = chain.state.clone();
+        // earlier one and the vault ends the block empty. The scratch
+        // copy detaches the value from the chain's shared `Arc`, so the
+        // staging transaction never touches the live state.
+        let mut scratch = (*chain.state).clone();
         scratch.tx(
             user,
             &[range],
@@ -246,31 +250,44 @@ pub(crate) fn mine_block(
     let slot_ok = |slot: u64| {
         chain
             .state
-            .owns(crate::state::TREASURY, slot, slot + 1, height)
+            .get(slot)
+            .map(|(_, _, owner)| owner == crate::state::TREASURY)
+            .unwrap_or(false)
             && !input_spans.iter().any(|&(s, e)| slot >= s && slot < e)
     };
-    // Difficulty one accepts the first nonce; later difficulties scan
-    // forward. The verifier rebuilds the input for every candidate, so
-    // miner and verifier hash identical buffers by construction.
-    let mut nonce = 0u64;
-    let (slot, time) = loop {
-        match crate::chain::verify_pow(prev, time, height, miner, nonce, difficulty) {
-            Some(cell) if slot_ok(cell) => break (cell, time),
-            _ => nonce += 1,
-        }
+    // Light-context nonce search at difficulty one: the simulation needs
+    // a valid proof, not a mining benchmark, and the light context is
+    // the exact input the verifier hashes.
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let found = crate::mining::mine(prev, time, height, miner, difficulty, cancel, slot_ok);
+    let mut block = match found {
+        Some(found) => crate::chain::Block {
+            version: 1,
+            prev,
+            time: found.time,
+            height,
+            nonce: found.nonce,
+            miner,
+            mined_cell: found.value % crate::state::N,
+            txs: all,
+            fee_claims: vec![],
+            difficulty,
+            page_roots: std::collections::BTreeMap::new(),
+        },
+        None => crate::chain::Block {
+            version: 1,
+            prev,
+            time,
+            height,
+            nonce: 0,
+            miner,
+            mined_cell: 0,
+            txs: all,
+            fee_claims: vec![],
+            difficulty,
+            page_roots: std::collections::BTreeMap::new(),
+        },
     };
-    let block = crate::chain::Block {
-        version: 1,
-        prev,
-        time,
-        height,
-        nonce,
-        miner,
-        mined_cell: slot,
-        txs: all,
-        fee_claims: vec![],
-        difficulty,
-        page_roots: std::collections::BTreeMap::new(),
-    };
-    chain.prepare_block(block)
+    block = chain.prepare_block(block);
+    block
 }

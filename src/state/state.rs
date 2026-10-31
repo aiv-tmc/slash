@@ -12,10 +12,12 @@
 //! `locks.rs`, the transfer pipeline in `transfer.rs`, fee sweeps in
 //! `fees.rs`, and canonical selection in `selection.rs`.
 
+use super::locks::LockIndex;
 use super::page::{Page, R};
 use super::params::{page_id, page_offset, page_size, PAGE_SIZE, TREASURY};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
 /// The full ledger state: dirty pages, the lock maps, the incremental
 /// balance cache, and the economic parameters that consensus reads on
@@ -36,6 +38,13 @@ pub struct State {
     /// submission: cells locked inside the voting window buy no influence
     /// on the proposal already open.
     pub lock_created: BTreeMap<u64, u64>,
+    /// Summarizes the lock map for the O(1) live-lock count the global
+    /// cap gate uses; it introduces no state of its own and every count
+    /// remains exact while it is unbuilt (see `locks.rs`). Snapshots
+    /// persist it; the header does not, and a state materialized from
+    /// the header rebuilds it lazily on the first mutation.
+    #[serde(default)]
+    pub lock_index: LockIndex,
     /// Incremental balance cache: owner to total cells. The std HashMap
     /// is deliberate: storage.rs Header carries the same type, and both
     /// are serialized with bincode, so the in-memory and on-disk layouts
@@ -72,31 +81,24 @@ pub struct State {
     pub emergency_until: u64,
     /// Pages dirtied since the last persisted save. Every mutation goes
     /// through `get_page_mut`, which records the page here; the storage
-    /// layer drains the set to append exactly those pages to the
-    /// append-only page log, so a save rewrites O(touched) instead of
-    /// O(dirty). The mutex keeps the shared-reference save path usable
-    /// from `&State`; the set is excluded from serialization because it
-    /// is runtime bookkeeping, not ledger state. Draining clears the set,
-    /// so a poisoned lock panics loudly instead of silently missing a
-    /// write.
+    /// layer drains the set to append exactly those pages on the next
+    /// save. Not persisted: the set is always empty on a fresh process,
+    /// so serializing it would write noise.
     #[serde(skip)]
-    pub touched_pages: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<u16>>>,
+    pub touched_pages: Arc<Mutex<HashSet<u16>>>,
 }
 
 impl State {
-    /// A fresh ledger: no materialized pages, no locks, and an empty
-    /// balance cache. The cache is filled lazily — the first mint,
-    /// transfer, or fee claim creates its entries — and an untouched
-    /// address, including the treasury, reports a zero balance. Signer
-    /// keys are zero so that neither treasury nor dev-fund spending is
-    /// possible until keys are configured, and the dev-fund shares start
-    /// at zero so nothing is required before governance activates the
-    /// rule.
+    /// The genesis state: no materialized pages (the full supply is
+    /// implicit in the pristine pages), empty lock maps, and the default
+    /// economic parameters. Genesis is the anchor every node agrees on
+    /// without trusting any external data.
     pub fn genesis() -> Self {
         Self {
             pages: BTreeMap::new(),
             locks: BTreeMap::new(),
             lock_created: BTreeMap::new(),
+            lock_index: LockIndex::default(),
             balance_cache: HashMap::new(),
             treasury_signer: [0u8; 32],
             total_sold: 0,
@@ -107,40 +109,35 @@ impl State {
             dao: crate::dao::DaoState::genesis(),
             emergency_flags: 0,
             emergency_until: 0,
-            touched_pages: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashSet::new(),
-            )),
+            touched_pages: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
-    /// Read the owner of the range containing the global cell index.
-    /// Returns (page_id, offset_within_page, owner), reconstructing
-    /// pristine pages as a single treasury range.
+    /// The owner of `cell` together with the page-local coordinates:
+    /// `(page_id, page_offset, owner)`. Clean pages are reconstructed as
+    /// one pristine treasury range, so ownership of an untouched cell is
+    /// answered without materializing anything.
     pub fn get(&self, cell: u64) -> Option<(u16, u64, [u8; 32])> {
         let id = page_id(cell);
         let off = page_offset(cell);
         if let Some(page) = self.pages.get(&id) {
-            let r = page.ranges.range(..=off).next_back()?;
-            if off < r.1.e {
-                return Some((id, off, r.1.o));
-            }
-            None
-        } else if off < page_size(id) {
-            Some((id, off, TREASURY))
+            // The last range starting at or below the offset owns the
+            // cell; a materialized page covers every offset, so the
+            // lookup always resolves.
+            let (_, r) = page.ranges.range(..=off).next_back()?;
+            Some((id, off, r.o))
         } else {
-            None
+            Some((id, off, TREASURY))
         }
     }
 
-    /// Ownership and lock check over a global half-open span. Returns
-    /// true only when every cell in `[start, end)` is owned by `owner`
-    /// and no cell in the span is locked beyond `height`.
-    ///
-    /// The lock scan covers the entire queried span on every ownership
-    /// segment, not just the segment entry point: the ownership map
-    /// compacts adjacent ranges through merging, and a lock registered in
-    /// the interior of a merged range must still block a spend that
-    /// covers it.
+    /// Whether `owner` may move the whole span `[start, end)` at `height`.
+    /// Ownership must hold for every covered cell, so the span is walked
+    /// one owner range at a time and any foreign cell refuses the whole
+    /// spend. Any lock whose expiry is strictly above the height blocks
+    /// the span regardless of who registered it: a lock binds the cell,
+    /// not the owner, so an incoming transfer cannot move a cell whose
+    /// lock has not yet run out.
     pub(crate) fn owns(&self, owner: [u8; 32], start: u64, end: u64, height: u64) -> bool {
         let mut cur = start;
         while cur < end {
@@ -150,26 +147,23 @@ impl State {
             if o != owner {
                 return false;
             }
-            // Advance to the exclusive end of the range that contains
-            // `cur`.
+            // The owner range containing this cell: either the range
+            // found by the lookup, extended to the page end, or the whole
+            // pristine page as one range.
             let range_end = match self.pages.get(&id) {
-                Some(page) => {
-                    let r = page
-                        .ranges
-                        .range(..=off)
-                        .next_back()
-                        .map(|(_, r)| r.e)
-                        .unwrap_or(off + 1);
-                    id as u64 * PAGE_SIZE + r
-                }
-                None => (id as u64 + 1) * PAGE_SIZE,
+                Some(page) => page
+                    .ranges
+                    .range(..=off)
+                    .next_back()
+                    .map(|(_, r)| r.e)
+                    .unwrap_or(off + 1),
+                None => page_size(id),
             };
-            // Inspect every lock inside this ownership segment, capped at
-            // the query end. A single live lock anywhere in the segment
-            // rejects the spend, no matter where the lock sits relative
-            // to merged range boundaries; expired locks never block.
-            let seg_end = range_end.min(end);
-            for (_, &until) in self.locks.range(cur..seg_end) {
+            let seg_end = (id as u64 * PAGE_SIZE + range_end).min(end);
+            // The lock map is keyed by global cell index and sorted, so
+            // the scan visits exactly the span's locked cells; any lock
+            // still binding at the height refuses the segment.
+            for (&_locked, &until) in self.locks.range(cur..seg_end) {
                 if until > height {
                     return false;
                 }
@@ -179,24 +173,23 @@ impl State {
         true
     }
 
-    /// Materialize a page (pristine reconstruction when absent) and
-    /// return an owned copy. The page is NOT inserted into the dirty map.
+    /// A clone of the page, materializing a pristine page first when the
+    /// cell has never been touched. Callers that only read reach for
+    /// `get`; this is the shared read path for mutations that need the
+    /// full range map.
     pub fn get_page(&self, id: u16) -> Page {
-        if let Some(p) = self.pages.get(&id) {
-            p.clone()
-        } else {
-            let mut p = Page {
-                ranges: BTreeMap::new(),
+        match self.pages.get(&id) {
+            Some(p) => p.clone(),
+            None => Page {
+                ranges: BTreeMap::from_iter([(
+                    0,
+                    R {
+                        e: page_size(id),
+                        o: TREASURY,
+                    },
+                )]),
                 ..Default::default()
-            };
-            p.ranges.insert(
-                0,
-                R {
-                    e: page_size(id),
-                    o: TREASURY,
-                },
-            );
-            p
+            },
         }
     }
 
@@ -260,8 +253,8 @@ impl State {
 
     /// The global root: blake3 over every page id paired with its root,
     /// with pristine pages contributing their implicit commitment. The
-    /// iteration order of the BTreeMap is deterministic, so the root is a
-    /// pure function of the state.
+    /// iteration order of the page id range is deterministic, so the
+    /// root is a pure function of the state.
     pub fn global_root(&self) -> [u8; 32] {
         let mut h = blake3::Hasher::new();
         for id in 0..super::params::page_count() {

@@ -86,10 +86,15 @@ pub fn load_latest_snapshot_record(max_height: u64) -> anyhow::Result<(u64, Snap
         // The record format is tried first; a legacy file holds exactly a
         // State and fails this attempt, after which the bare form is
         // accepted with empty governance.
-        if let Ok(record) = bincode::deserialize::<SnapshotRecord>(&bytes) {
+        if let Ok(mut record) = bincode::deserialize::<SnapshotRecord>(&bytes) {
+            // Anchor the live-lock index at the snapshot's own height so
+            // every count after recovery is O(1) amortized and exact from
+            // the first query.
+            record.state.rebuild_lock_index(h);
             return Ok((h, record));
         }
-        if let Ok(state) = bincode::deserialize::<crate::state::State>(&bytes) {
+        if let Ok(mut state) = bincode::deserialize::<crate::state::State>(&bytes) {
+            state.rebuild_lock_index(h);
             return Ok((
                 h,
                 SnapshotRecord {

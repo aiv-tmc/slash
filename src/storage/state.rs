@@ -8,6 +8,7 @@
 
 use super::{atomic_write, data_path, Header};
 use std::collections::BTreeMap;
+use std::io::Write;
 
 /// Append-only log of page versions. Each save appends the serialized
 /// pages it touched; the index sidecar maps page id to (offset, length),
@@ -37,7 +38,6 @@ fn compact_page_log(
     state: &crate::state::State,
     index: &mut Vec<(u16, u64, u64)>,
 ) -> anyhow::Result<()> {
-    use std::io::Write;
     let staged = data_path("pages.log.tmp");
     let mut file = std::fs::File::create(&staged)?;
     let mut rebuilt = Vec::with_capacity(index.len());
@@ -89,40 +89,26 @@ pub fn save(state: &crate::state::State) -> anyhow::Result<()> {
                 .filter(|p| !index.iter().any(|(q, _, _)| q == p)),
         )
         .collect();
-    if !pending.is_empty() {
-        use std::io::Write;
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(data_path(PAGES_LOG))?;
-        for pid in pending {
-            let page = state.pages.get(&pid).expect("pending page is dirty");
-            let bytes = bincode::serialize(page)?;
-            let off = file.metadata()?.len();
-            file.write_all(&bytes)?;
-            index.retain(|(q, _, _)| *q != pid);
-            index.push((pid, off, bytes.len() as u64));
-        }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(data_path(PAGES_LOG))?;
+    for pid in pending {
+        let page = state.pages.get(&pid).expect("dirty page is in memory");
+        let bytes = bincode::serialize(page)?;
+        let off = file.metadata()?.len();
+        file.write_all(&bytes)?;
         file.sync_all()?;
-        index.sort_by_key(|(p, _, _)| *p);
+        index.push((pid, off, bytes.len() as u64));
     }
-    // Pages evicted back to pristine drop out of the index: their
-    // commitment equals the pristine reconstruction, so the loader loses
-    // nothing by not finding them.
-    index.retain(|(p, _, _)| state.pages.contains_key(p));
-    if std::fs::metadata(data_path(PAGES_LOG))
-        .map(|m| m.len())
-        .unwrap_or(0)
-        > COMPACT_THRESHOLD_BYTES
-    {
+    // Compact past the threshold: one current version per dirty page.
+    if file.metadata()?.len() > COMPACT_THRESHOLD_BYTES {
         compact_page_log(state, &mut index)?;
     }
+    index.sort_by_key(|(p, _, _)| *p);
     atomic_write(PAGES_INDEX, &bincode::serialize(&index)?)?;
-    // Build and write the state header last: it lists both lock maps and
-    // the balance cache, so a restart rebuilds balances without replaying
-    // the chain, and it pins the emergency pause in effect at this save.
     let header = Header {
-        page_ids: state.pages.keys().cloned().collect(),
+        page_ids: state.pages.keys().copied().collect(),
         locks: state.locks.clone(),
         lock_created: state.lock_created.clone(),
         balance_cache: state.balance_cache.clone(),
@@ -136,6 +122,9 @@ pub fn save(state: &crate::state::State) -> anyhow::Result<()> {
         emergency_flags: state.emergency_flags,
         emergency_until: state.emergency_until,
     };
+    // The header is written last: a save that dies anywhere above leaves
+    // the previous consistent triple in place, and the journal replays
+    // forward from it.
     atomic_write("header.bin", &bincode::serialize(&header)?)?;
     Ok(())
 }
@@ -147,6 +136,11 @@ pub fn save(state: &crate::state::State) -> anyhow::Result<()> {
 /// header. Missing or corrupt header files are hard errors: a state that
 /// cannot be reconstructed must never be silently replaced with a
 /// fabricated one.
+///
+/// The live-lock index is not persisted in the header: it summarizes the
+/// lock map and is rebuilt on the first mutation after load, so both
+/// constructors install the default (unbuilt) index and every count
+/// remains exact until the engine itself settles it.
 pub fn load() -> anyhow::Result<crate::state::State> {
     let header_bytes = std::fs::read(data_path("header.bin"))?;
     let header: Header = bincode::deserialize(&header_bytes)?;
@@ -167,6 +161,7 @@ pub fn load() -> anyhow::Result<crate::state::State> {
                 pages,
                 locks: header.locks,
                 lock_created: header.lock_created,
+                lock_index: Default::default(),
                 balance_cache: header.balance_cache,
                 treasury_signer: header.treasury_signer,
                 total_sold: header.total_sold,
@@ -193,6 +188,7 @@ pub fn load() -> anyhow::Result<crate::state::State> {
         pages,
         locks: header.locks,
         lock_created: header.lock_created,
+        lock_index: Default::default(),
         balance_cache: header.balance_cache,
         treasury_signer: header.treasury_signer,
         total_sold: header.total_sold,

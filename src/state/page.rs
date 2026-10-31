@@ -121,11 +121,25 @@ impl Page {
 
     /// The Merkle root of the range map: blake3 leaves over
     /// start || end || owner, hashed up in deterministic pairs.
+    ///
+    /// An empty map has no ranges to commit to, and every reachable
+    /// consistent state keeps every materialized page fully covered (the
+    /// per-page balance gate forces each transaction to return exactly
+    /// as many cells as it removes from a page), so an empty page can
+    /// only arise from a corrupted or hand-built state. Such a state
+    /// must still hash deterministically instead of aborting the node:
+    /// the commitment binds a dedicated domain string, so it can never
+    /// collide with a real page root or with a pristine commitment.
     pub fn merkle_root(&self) -> [u8; 32] {
         if self.ranges.is_empty() {
-            panic!("merkle_root of an empty page");
+            return Self::empty_root();
         }
         self.with_page_tree(|tree| tree.root())
+    }
+
+    /// The domain-separated commitment of an empty page map.
+    pub fn empty_root() -> [u8; 32] {
+        *blake3::hash(b"slash-empty-page").as_bytes()
     }
 
     /// The root commitment of a pristine (never-touched) page: a single

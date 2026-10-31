@@ -7,9 +7,18 @@
 //! value), keep the balance cache in lockstep with the page map, and
 //! release locks only together with a successful reassignment: a lock
 //! leaves both the expiry map and the creation map at once, so the maps
-//! never describe the same cell differently. Locked outputs back to the
-//! treasury are refused inside the shared transfer engine, so no
-//! primitive can route a lock onto an address no key controls.
+//! never describe the same cell differently. Every release withdraws
+//! the entry's booking from the live-lock index, keeping the index an
+//! exact mirror of the lock map. Locked outputs back to the treasury
+//! are refused inside the shared transfer engine, so no primitive can
+//! route a lock onto the treasury address.
+//!
+//! Every balance-cache debit is checked against the cache before the
+//! page map is touched: on a consistent state the covering entry always
+//! holds the debited amount (every credit lands through the same commit
+//! path), but a corrupted or hand-built state must refuse the primitive
+//! cleanly instead of panicking in debug or wrapping to a bogus
+//! near-maximum balance in release.
 
 use super::page::Output;
 use super::params::{N, TREASURY, TREASURY_VAULT};
@@ -34,6 +43,7 @@ impl State {
                     if until <= height {
                         self.locks.remove(&cell);
                         self.lock_created.remove(&cell);
+                        self.lock_index.unbook(until);
                     }
                 }
                 return;
@@ -47,6 +57,14 @@ impl State {
             if until > height {
                 return;
             }
+            // The cache must cover the debit before the page map is
+            // touched: on a consistent state the current owner was
+            // credited at least this cell, but a desynchronized cache
+            // refuses the reassignment instead of wrapping.
+            let owner_bal = self.balance_cache.get(&o).copied().unwrap_or(0);
+            if owner_bal < 1 {
+                return;
+            }
             let page = self.get_page_mut(id);
             if !page.remove_range(off, off + 1) {
                 return;
@@ -55,7 +73,8 @@ impl State {
             self.evict_if_pristine(id);
             self.locks.remove(&cell);
             self.lock_created.remove(&cell);
-            *self.balance_cache.entry(o).or_insert(0) -= 1;
+            self.lock_index.unbook(until);
+            *self.balance_cache.entry(o).or_insert(0) = owner_bal - 1;
             *self.balance_cache.entry(owner).or_insert(0) += 1;
             return;
         }
@@ -64,16 +83,29 @@ impl State {
                 return;
             }
         }
+        // The treasury cache entry must cover the debit before the page
+        // map is touched: an absent entry stands for the full unissued
+        // supply, and a present entry must hold at least one cell while
+        // the page map shows this cell still treasury-owned.
+        let treasury_bal = self.balance_cache.get(&TREASURY).copied().unwrap_or(N);
+        if treasury_bal < 1 {
+            return;
+        }
         let page = self.get_page_mut(id);
         if !page.remove_range(off, off + 1) {
             return;
         }
         page.insert_output(off, off + 1, owner);
         self.evict_if_pristine(id);
-        self.locks.remove(&cell);
+        // The treasury branch reached here only past the live-lock guard
+        // above, so an entry still present is an expired registration;
+        // the index booking leaves with the entry.
+        if let Some(until) = self.locks.remove(&cell) {
+            self.lock_index.unbook(until);
+        }
         self.lock_created.remove(&cell);
         *self.balance_cache.entry(owner).or_insert(0) += 1;
-        *self.balance_cache.entry(TREASURY).or_insert(N) -= 1;
+        *self.balance_cache.entry(TREASURY).or_insert(N) = treasury_bal - 1;
     }
 
     /// The proof-of-work slot mint: reassign one treasury-owned cell to
@@ -91,16 +123,26 @@ impl State {
         if self.locks.get(&cell).is_some_and(|&until| until > height) {
             return false;
         }
+        // The treasury cache entry must cover the debit before the page
+        // map is touched, exactly as in the mine backfill above.
+        let treasury_bal = self.balance_cache.get(&TREASURY).copied().unwrap_or(N);
+        if treasury_bal < 1 {
+            return false;
+        }
         let page = self.get_page_mut(id);
         if !page.remove_range(off, off + 1) {
             return false;
         }
         page.insert_output(off, off + 1, miner);
         self.evict_if_pristine(id);
-        self.locks.remove(&cell);
+        // Past the live-lock guard an entry still present is expired;
+        // the index booking leaves with it.
+        if let Some(until) = self.locks.remove(&cell) {
+            self.lock_index.unbook(until);
+        }
         self.lock_created.remove(&cell);
         *self.balance_cache.entry(miner).or_insert(0) += 1;
-        *self.balance_cache.entry(TREASURY).or_insert(N) -= 1;
+        *self.balance_cache.entry(TREASURY).or_insert(N) = treasury_bal - 1;
         true
     }
 

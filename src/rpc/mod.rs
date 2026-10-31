@@ -221,16 +221,17 @@ pub async fn serve_with_config(
     } else {
         IpAddr::V4(Ipv4Addr::LOCALHOST)
     };
-    serve_shared(bind, port, Arc::new(RpcShared::new(cmd).with_control_token(token))).await
+    serve_shared(
+        bind,
+        port,
+        Arc::new(RpcShared::new(cmd).with_control_token(token)),
+    )
+    .await
 }
 
 /// The shared server bootstrap: one POST route, the listener, and the
 /// connection-info extractor that feeds the per-IP rate limiter.
-async fn serve_shared(
-    bind: IpAddr,
-    port: u16,
-    shared: Arc<RpcShared>,
-) -> std::io::Result<()> {
+async fn serve_shared(bind: IpAddr, port: u16, shared: Arc<RpcShared>) -> std::io::Result<()> {
     let app = Router::new().route("/", post(handle)).with_state(shared);
     let listener = tokio::net::TcpListener::bind((bind, port)).await?;
     axum::serve(
@@ -330,20 +331,36 @@ pub(super) async fn dispatch(
 /// the first object param; a missing or mismatched token refuses the
 /// call with the dedicated authorization error before it reaches the
 /// command channel, so an unauthenticated network peer can neither
-/// shut the node down nor trigger its miner.
+/// shut the node down nor trigger its miner. The token comparison runs
+/// in constant time: an early-exit string equality would leak the
+/// token prefix through response timing on an external socket.
 fn control_authorized(shared: &RpcShared, params: &Value) -> Result<(), RpcError> {
     let Some(expected) = &shared.control_token else {
         return Ok(());
     };
-    let presented = params
-        .as_array()
-        .and_then(|a| a.first())
-        .and_then(|v| v.as_str().or_else(|| v.get("token").and_then(Value::as_str)));
-    if presented == Some(expected.as_ref()) {
-        Ok(())
-    } else {
-        Err(RpcError::unauthorized(
+    let presented = params.as_array().and_then(|a| a.first()).and_then(|v| {
+        v.as_str()
+            .or_else(|| v.get("token").and_then(Value::as_str))
+    });
+    match presented {
+        Some(p) if token_matches(p, expected) => Ok(()),
+        _ => Err(RpcError::unauthorized(
             "control methods require the configured RPC token",
-        ))
+        )),
     }
+}
+
+/// Constant-time token equality. Every byte position contributes to the
+/// accumulator through XOR, so no prefix mismatch short-circuits the scan
+/// and the running time is independent of how much of the presented
+/// value is correct.
+fn token_matches(presented: &str, expected: &str) -> bool {
+    let (p, e) = (presented.as_bytes(), expected.as_bytes());
+    let mut acc = p.len() ^ e.len();
+    for i in 0..p.len().max(e.len()) {
+        let a = p.get(i).copied().unwrap_or(0);
+        let b = e.get(i).copied().unwrap_or(0);
+        acc |= (a ^ b) as usize;
+    }
+    acc == 0
 }

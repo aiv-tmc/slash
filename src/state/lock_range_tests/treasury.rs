@@ -119,7 +119,7 @@ fn locked_sell_to_treasury_is_rejected_by_mempool_structural_policy() {
     // the mempool either.
     let mut chain = Chain::genesis();
     let (sk, pk) = crate::crypto::generate_keypair();
-    fund(&mut chain.state, 0, 200, pk);
+    fund(chain.state_mut(), 0, 200, pk);
     let outputs = vec![
         Output {
             start: 0,

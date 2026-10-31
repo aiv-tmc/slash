@@ -135,9 +135,12 @@ pub fn test_keypair(seed: u8) -> ([u8; 32], [u8; 32]) {
 
 /// Build a genesis chain whose treasury signer is the public half of
 /// `TREASURY_SK`, so treasury mints and payouts verify without any
-/// additional node configuration.
+/// additional node configuration. The mutation goes through
+/// `Arc::make_mut`: a fixture-owned genesis chain always has a unique
+/// reference, so the write happens in place without copying the state.
 pub fn treasury_genesis() -> chain::Chain {
     let mut chain = chain::Chain::genesis();
-    chain.state.treasury_signer = crypto::public_from_secret(&TREASURY_SK);
+    std::sync::Arc::make_mut(&mut chain.state).treasury_signer =
+        crypto::public_from_secret(&TREASURY_SK);
     chain
 }

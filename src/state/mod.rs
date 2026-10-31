@@ -15,8 +15,11 @@
 //! - `page` — the range-map page, its Merkle tree, and page proofs
 //! - `state` — the `State` aggregate, its constructors and accessors
 //! - `minting` — the consensus mint primitives (slot, mint, payout)
-//! - `locks` — lock-map maintenance
-//! - `transfer` — the user/treasury transfer pipeline
+//! - `locks` — lock-map maintenance and the live-lock index
+//! - `transfer` — the user/treasury transfer entry points
+//! - `transfer_stage` — the staging overlay and commit (child of `transfer`)
+//! - `transfer_speculative` — the read-only admission twin (child of `transfer`)
+//! - `transfer_gates` — the shared predicate core (child of `transfer`)
 //! - `fees` — the miner fee-claim sweep
 //! - `selection` — canonical unlocked-range selection
 //! - `tests` — unit tests (test-only)
@@ -43,6 +46,7 @@ mod state;
 mod tests;
 mod transfer;
 
+pub use locks::LockIndex;
 pub use page::*;
 pub use params::*;
 pub use state::*;

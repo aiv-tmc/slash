@@ -1,6 +1,7 @@
 //! Page roots and proofs: leaves come from the range map itself (the
-//! short final page behaves like any other), an empty page fails loudly,
-//! and the global root is deterministic.
+//! short final page behaves like any other), an empty page carries a
+//! domain-separated commitment instead of aborting the node, and the
+//! global root is deterministic.
 
 use super::*;
 
@@ -46,17 +47,22 @@ fn merkle_root_and_proof() {
 }
 
 #[test]
-#[should_panic(expected = "merkle_root of an empty page")]
-fn merkle_root_of_empty_page_fails_loudly() {
-    // A detached page with an empty range map is a construction error;
-    // hashing it must panic with a diagnostic instead of silently
-    // producing the root of a wrong implicit page (the hazard an
-    // implicit page-id fallback would create).
+fn merkle_root_of_empty_page_is_the_domain_separated_commitment() {
+    // A detached page with an empty range map cannot arise on any
+    // reachable consistent state — the per-page balance gate forces
+    // every transaction to return exactly as many cells as it removes
+    // from a page — but a corrupted or hand-built state must still hash
+    // deterministically instead of aborting the node. The commitment
+    // binds a dedicated domain string: it never collides with a real
+    // page root and never equals a pristine commitment, so an empty
+    // page can never be mistaken for a full-treasury one.
     let page = Page {
         ranges: BTreeMap::new(),
         ..Default::default()
     };
-    let _ = page.merkle_root();
+    let root = page.merkle_root();
+    assert_eq!(root, Page::empty_root());
+    assert_ne!(root, Page::pristine_root(PAGE_SIZE));
 }
 
 #[test]

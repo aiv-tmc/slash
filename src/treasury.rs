@@ -62,9 +62,12 @@ pub struct TreasuryState {
 }
 
 impl TreasuryState {
-    /// Load treasury state from disk using the compact bincode format.
+    /// Load treasury state from disk in compact bincode format. The path
+    /// resolves against the process data directory installed by
+    /// `slash_init`, exactly like `save`, so an embedded node never
+    /// touches the host's working directory.
     pub fn load() -> Option<Self> {
-        if let Ok(bytes) = std::fs::read("treasury.bin") {
+        if let Ok(bytes) = std::fs::read(crate::storage::data_path("treasury.bin")) {
             if let Ok(t) = bincode::deserialize(&bytes) {
                 return Some(t);
             }
