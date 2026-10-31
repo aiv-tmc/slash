@@ -43,8 +43,24 @@ fn test_difficulty_retargets_every_interval() {
     assert_eq!(chain.next_difficulty(), 4);
     // The template grinds against the chain's next difficulty: the block
     // carrying difficulty four, and applying it, proves the live loop
-    // drives the retarget end to end.
-    let real = mine_next_block(&chain, miner, vec![]);
+    // drives the retarget end to end. The stamped time continues the
+    // mock clock: the generic `mine_next_block` fixture stamps its
+    // blocks with `time = height`, which is only consistent for
+    // fixture-built chains whose clock is the height itself — on this
+    // synthetic chain that stamp sits far below the median-time window
+    // and the block would be refused as a stale timestamp. The explicit
+    // fixture takes the height, the time, and the difficulty, so the
+    // real proof is stamped and targeted exactly like the live loop
+    // would produce it.
+    let height = chain.tip_height() + 1;
+    let real = mine_block_at(
+        &chain,
+        height,
+        time + 2,
+        miner,
+        chain.next_difficulty(),
+        vec![],
+    );
     assert_eq!(real.difficulty, 4);
     chain.apply(real).unwrap();
     assert_eq!(chain.next_difficulty(), 4);
