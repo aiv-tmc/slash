@@ -230,8 +230,8 @@ A C-compatible API is provided for hardware wallet and mobile integration:
 
 ## Network Identifiers
 
-- **Mainnet**: `/slash/0.6.0`
-- **Testnet**: `/slash/test/0.6.0`
+- **Mainnet**: `/slash/0.7.0`
+- **Testnet**: `/slash/test/0.7.0`
 
 The `TESTNET_MODE` atomic boolean switches signature hashing between the two chain IDs, preventing replay across networks.
 

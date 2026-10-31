@@ -1,6 +1,6 @@
 [package]
 name = "slash"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 # Minimum supported Rust version. The codebase relies on integer
 # `is_multiple_of` (1.87) and `Option::is_none_or` (1.82).

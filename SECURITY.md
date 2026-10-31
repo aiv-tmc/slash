@@ -1,16 +1,5 @@
 # Security Policy
 
-## Supported Versions
-
-The following versions of Slash Protocol receive security updates:
-
-| Version | Support status |
-|---|---|
-| 0.5.x (current) | Active: all consensus, networking, and RPC fixes |
-| 0.4.x and earlier | No longer supported; upgrade before connecting to a live network |
-
-Security fixes land on `main` first and are backported to the newest release branch while it remains supported.
-
 ## Reporting a Vulnerability
 
 We take security seriously. If you discover a vulnerability, please follow the responsible disclosure process outlined below.

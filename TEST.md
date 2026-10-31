@@ -1,6 +1,6 @@
 # Slash Protocol — Test Coverage Matrix
 
-**Version:** 0.6.0
+**Version:** 0.7.0
 **Status:** authoritative. A documented rule without a row in this matrix is treated as not implemented. Every consensus change must update this matrix in the same pull request.
 
 ## Legend
