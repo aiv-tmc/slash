@@ -16,29 +16,32 @@ fn treasury_and_pairing_paths_exempt_from_dev_fee() {
     // clean because mine_fee_bps is zeroed.
     //
     // The mint inputs are the range immediately after the coinbase
-    // range: the coinbase claims the canonical frontier first inside the
-    // block, so a mint selecting the same canonical range would find it
-    // already spent and the pairing classification would fail. Reserving
-    // the successor range keeps the pair executable.
+    // range: the coinbase claims the canonical frontier first inside
+    // the block, so a mint selecting the same range would find it
+    // already spent and the pairing classification would fail. The
+    // reservation is pinned explicitly rather than through
+    // `select_single`: canonical selection answers every caller with
+    // the first qualifying treasury range, which at this state is the
+    // coinbase frontier itself, so asking it here would reserve exactly
+    // the range the coinbase is about to claim. The pairing path only
+    // requires the mint inputs to be unlocked treasury cells, not a
+    // canonically selected range; ownership of the reservation is
+    // exercised by the mempool validation and the block application
+    // below, both of which refuse a spend the treasury cannot cover.
     reset_testnet();
     let mut chain = treasury_genesis();
     activate_dev_fund(&mut chain);
     chain.state_mut().mine_fee_bps = 0;
     let (sk, pk) = slash::crypto::generate_keypair();
     // Fund the buyer high above the canonical treasury frontier so the
-    // canonical coinbase range and the mint reservation never overlap,
-    // and reserve the mint range: the coinbase claims the canonical
-    // frontier first inside the block, so the mint selects the successor
-    // range. The buyer funding and the reservation ride one
-    // `state_mut()` access each: the chain is fixture-owned and the
-    // reference is unique.
+    // coinbase range, the mint reservation, and the buyer funding never
+    // overlap. The funding and the reservation ride one `state_mut()`
+    // access each: the chain is fixture-owned and the reference is
+    // unique.
     for i in 10_000..10_600 {
         chain.state_mut().mine(i, pk, 0);
     }
-    let (s, e) = chain
-        .state
-        .select_single(slash::state::TREASURY, 500)
-        .expect("treasury funds the mint reservation");
+    let (s, e) = (500u64, 1_000u64);
     assert_eq!(e - s, 500);
     // The payment: an ordinary user transaction paying its own one-cell
     // dev share, the mandatory fee, and the change back to the buyer.

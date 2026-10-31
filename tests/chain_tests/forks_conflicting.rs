@@ -20,7 +20,16 @@ fn conflicting_reorg_resolves_single_owner() {
     fund_alice(chain.state_mut());
     let b1_hash = chain.block_hash(&b1);
     let chain_id = chain.chain_id.clone();
+
+    // Alice is funded after block 1 is applied. The current tip state
+    // receives the funding for the main branch, and the retained height-1
+    // snapshot receives the same funding so fork validation replays from
+    // exactly the state both branches share.
+    chain
+        .state_history
+        .insert(b1.height, std::sync::Arc::clone(&chain.state));
     let base_state = b1_state(&chain);
+
     let spend_bob = alice_spend(&spend_outputs(bob), chain_id.as_bytes());
     let spend_carol = alice_spend(&spend_outputs(carol), chain_id.as_bytes());
 
@@ -110,7 +119,12 @@ fn conflicting_reorg_keeps_disconnected_transactions() {
     fund_alice(chain.state_mut());
     let b1_hash = chain.block_hash(&b1);
     let chain_id = chain.chain_id.clone();
+
+    chain
+        .state_history
+        .insert(b1.height, std::sync::Arc::clone(&chain.state));
     let base_state = b1_state(&chain);
+
     let spend_bob = alice_spend(&spend_outputs(bob), chain_id.as_bytes());
     let spend_carol = alice_spend(&spend_outputs(carol), chain_id.as_bytes());
 
@@ -129,8 +143,6 @@ fn conflicting_reorg_keeps_disconnected_transactions() {
     chain.apply(a2.clone()).expect("branch A applies");
 
     // Branch B: block 2' pays Carol and is followed by an empty block 3'.
-    // The history entries are shared snapshots; the working copy
-    // detaches the value so the fork builder can advance it.
     let mut fork_scratch = base_state.clone();
     let b2 = build_fork_block(
         &mut chain,
@@ -200,7 +212,12 @@ fn conflicting_reorg_rolls_back_and_restores() {
     fund_alice(chain.state_mut());
     let b1_hash = chain.block_hash(&b1);
     let chain_id = chain.chain_id.clone();
+
+    chain
+        .state_history
+        .insert(b1.height, std::sync::Arc::clone(&chain.state));
     let base_state = b1_state(&chain);
+
     let spend_bob = alice_spend(&spend_outputs(bob), chain_id.as_bytes());
     let spend_carol = alice_spend(&spend_outputs(carol), chain_id.as_bytes());
 
@@ -220,8 +237,6 @@ fn conflicting_reorg_rolls_back_and_restores() {
     let a2_hash = chain.block_hash(&a2);
 
     // Branch B is heavier and reorgs branch A away.
-    // The history entries are shared snapshots; the working copy
-    // detaches the value so the fork builder can advance it.
     let mut fork_scratch = base_state.clone();
     let b2 = build_fork_block(
         &mut chain,
@@ -255,9 +270,16 @@ fn conflicting_reorg_rolls_back_and_restores() {
     assert_eq!(chain.state.balance(carol), 180);
     assert_eq!(chain.state.balance(bob), 0);
 
-    // Branch A becomes heavier again and reorgs branch B away: the
-    // original owner is restored exactly.
-    let mut restore_scratch = base_state.clone();
+    // Branch A must be re-admitted explicitly: a reorg disconnects its
+    // blocks but does not park them as side forks. Once a2 is retained,
+    // a3 extends it from the post-a2 state; equal work remains parked.
+    // a4 then makes branch A strictly heavier and restores Bob as owner.
+    assert_eq!(
+        chain.process_block(a2.clone()).unwrap(),
+        BlockProcessResult::SideFork
+    );
+
+    let mut restore_scratch = main_scratch.clone();
     let a3 = build_fork_block(
         &mut chain,
         &mut restore_scratch,
@@ -269,8 +291,12 @@ fn conflicting_reorg_rolls_back_and_restores() {
         true,
         STAGE_ADOPT,
     );
-    chain.process_block(a3).expect("branch A extends");
-    let a3_hash = chain.tip_hash();
+    let a3_hash = chain.block_hash(&a3);
+    assert_eq!(
+        chain.process_block(a3).unwrap(),
+        BlockProcessResult::SideFork
+    );
+
     let a4 = build_fork_block(
         &mut chain,
         &mut restore_scratch,
@@ -282,7 +308,13 @@ fn conflicting_reorg_rolls_back_and_restores() {
         true,
         STAGE_ADOPT,
     );
-    chain.process_block(a4).expect("branch A extends");
+    match chain.process_block(a4).unwrap() {
+        BlockProcessResult::Reorged { connected, .. } => {
+            assert_eq!(connected, vec![2, 3, 4]);
+        }
+        other => panic!("expected Reorged, got {:?}", other),
+    }
+
     dump_balances(&chain, STAGE_ASSERT, miner_a, miner_b, bob, carol);
     assert_eq!(chain.state.balance(bob), 180);
     assert_eq!(chain.state.balance(carol), 0);

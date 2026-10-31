@@ -20,6 +20,13 @@ fn memo_submit_and_vote_flow_through_blocks() {
     chain.state_mut().mine(2_000, pk, 0);
     chain.state_mut().locks.insert(2_000, 1 + DAO_LOCK_MIN);
     chain.state_mut().lock_created.insert(2_000, 0);
+    // Fund the treasury vault so the payout payload is executable at its
+    // scheduled height: a payout proposal against an empty vault has no
+    // funding source and expires by design, which would leave the
+    // lifecycle assertions below without an execution to observe.
+    for i in 3_000..3_050 {
+        chain.state_mut().mine(i, slash::state::TREASURY_VAULT, 0);
+    }
 
     // Block 1: submit the payout proposal.
     let submit_outputs = transfer_outputs(&[inputs], [8u8; 32], 100, pk);

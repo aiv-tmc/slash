@@ -1,11 +1,10 @@
 //! `test_block_hash_deterministic` — one test case of the `integration_tests` suite.
 //!
-//! The fixture `mine_valid_block` helper comes from the crate root via
-//! `use super::*;`; the `Chain` type is imported explicitly so this file
-//! compiles on its own.
+//! The block fixture is imported explicitly so this file compiles on its
+//! own; the `Chain` type comes from the public library API.
 
-use super::*;
 use slash::chain::Chain;
+use slash::test_fixtures::mine_valid_block;
 
 #[test]
 fn test_block_hash_deterministic() {

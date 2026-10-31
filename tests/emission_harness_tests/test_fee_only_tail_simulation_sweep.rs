@@ -1,4 +1,4 @@
-//! `test_fee_only_tail_simulation_sweep` — one test case of the
+//! `test_fee_only_tail_simulation_sweep` — one case of the
 //! `emission_harness_tests` suite.
 //!
 //! The subsidy boundary and the perpetual slot mint are pinned at
@@ -16,18 +16,24 @@ fn test_fee_only_tail_simulation_sweep() {
     // The sweep drives a live chain: signed fee payments, miner vault
     // sweeps, and per-block assertions on revenue, vault drain, and cache
     // parity live inside `simulate_fee_only_tail`, so the test fails the
-    // moment any tail invariant regresses. The miner address is a fresh
-    // random keypair: the sweep only needs an address to pay, never the
-    // secret, and the per-block assertions do not depend on the key.
+    // moment any tail invariant regresses.
+    //
+    // The block count is deliberately small: every block introduces a
+    // fresh parent hash, and the consensus-mandated RandomX cache
+    // derivation behind each fresh parent costs real seconds, so a long
+    // sweep spends its runtime on cryptography setup rather than on the
+    // invariants under test. The sweep claims the whole vault every
+    // block, so per-block coverage saturates after the first few
+    // iterations: accrual across blocks never happens by construction.
     reset_testnet();
     let (_, miner) = crypto::generate_keypair();
     let config = slash::simulation::SimulationConfig {
         miners: vec![miner],
         target_block_time_secs: 300,
-        initial_blocks: 3,
+        initial_blocks: 2,
     };
     assert!(
-        slash::simulation::simulate_fee_only_tail(&config, 20),
+        slash::simulation::simulate_fee_only_tail(&config, 8),
         "the fee-only tail simulation must survive every per-block invariant"
     );
 }

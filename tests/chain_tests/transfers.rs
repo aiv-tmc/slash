@@ -12,12 +12,14 @@ fn test_transfer_moves_balance() {
     for i in 0..100 {
         mine_cell_for(chain.state_mut(), i, alice);
     }
-    // The outputs pack the inputs exactly: 25 to bob, 24 change, 1 fee.
+    // The outputs pack the spent input exactly: 25 to bob, 24 change,
+    // 1 fee. Alice keeps her remaining 50 unspent cells outside this
+    // transaction.
     let tx = make_tx_for(
         &chain,
         alice,
         &alice_sk,
-        &[(0, 100)],
+        &[(0, 50)],
         &[(0, 25, bob), (25, 49, alice), (49, 50, state::FEE_VAULT)],
         0,
     );
