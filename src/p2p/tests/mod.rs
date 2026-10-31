@@ -96,12 +96,12 @@ fn admit_treasury_payload_pairs_with_pending_sell() {
     // admission authenticates the payload against the configured signer
     // before any pairing logic runs.
     let (treasury_sk, treasury_pk) = crate::crypto::generate_keypair();
-    chain.state.treasury_signer = treasury_pk;
+    chain.state_mut().treasury_signer = treasury_pk;
     for i in 0..50 {
-        chain.state.mine(100 + i, [1u8; 32], 0);
+        chain.state_mut().mine(100 + i, [1u8; 32], 0);
     }
     for i in 0..48 {
-        chain.state.mine(i, crate::state::TREASURY_VAULT, 0);
+        chain.state_mut().mine(i, crate::state::TREASURY_VAULT, 0);
     }
     let mut pairs: HashMap<Vec<u8>, (Vec<u8>, usize)> = HashMap::new();
     let mut running_total = 0u64;

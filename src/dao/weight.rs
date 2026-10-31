@@ -50,7 +50,7 @@ fn weight_holds(state: &crate::state::State, cell: u64, snapshot_height: u64) ->
 /// exact because a live lock can never change hands.
 pub fn locked_weight(state: &crate::state::State, owner: [u8; 32], snapshot_height: u64) -> u64 {
     let mut weight = 0u64;
-    for (&cell, _) in &state.locks {
+    for &cell in state.locks.keys() {
         if !weight_holds(state, cell, snapshot_height) {
             continue;
         }
@@ -73,7 +73,7 @@ pub fn locked_weight(state: &crate::state::State, owner: [u8; 32], snapshot_heig
 /// the materialized ledger size.
 pub fn total_locked_weight(state: &crate::state::State, snapshot_height: u64) -> u64 {
     let mut weight = 0u64;
-    for (&cell, _) in &state.locks {
+    for &cell in state.locks.keys() {
         if weight_holds(state, cell, snapshot_height) {
             weight = weight.saturating_add(1);
         }

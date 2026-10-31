@@ -108,7 +108,10 @@ fn recover(mut chain: chain::Chain) -> chain::Chain {
     }
     let tip_len = chain.blocks.len() as u64;
     let tip = tip_len.saturating_add(chain.base_height).saturating_sub(1);
-    chain.state.prune_locks(tip);
+    // The freshly loaded state is uniquely owned (the history records
+    // start empty and the snapshots rebuild below), so the in-place
+    // mutation goes through `Arc::make_mut` without copying.
+    std::sync::Arc::make_mut(&mut chain.state).prune_locks(tip);
     chain
 }
 
@@ -190,7 +193,9 @@ pub fn load_pruned() -> chain::Chain {
         let mut chain = chain::Chain {
             blocks,
             base_height: meta.base_height,
-            state,
+            // The loaded tip state becomes the shared chain state; the
+            // history is rebuilt from an exact anchor below.
+            state: std::sync::Arc::new(state),
             // History is rebuilt from an exact anchor below; it starts
             // empty so a failed rebuild can never leave fabricated
             // entries behind.
@@ -253,7 +258,9 @@ pub fn load_pruned() -> chain::Chain {
     let mut chain = chain::Chain {
         blocks: Vec::new(),
         base_height: snap_height,
-        state: record.state,
+        // The snapshot state becomes the shared chain state; recovery
+        // replays the retained blocks on top of it through `apply`.
+        state: std::sync::Arc::new(record.state),
         state_history: std::collections::HashMap::new(),
         deployments_history: std::collections::HashMap::new(),
         checkpoints: record.checkpoints,

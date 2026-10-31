@@ -41,6 +41,7 @@ pub use load::{load_pruned, prune};
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::time::SystemTime;
 
 /// Process-wide network selector. `false` pins every signature hash to the
 /// mainnet chain identifier; `true` switches the whole process to the
@@ -49,8 +50,17 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 /// process.
 pub static TESTNET_MODE: AtomicBool = AtomicBool::new(false);
 
-/// The cached chain triple: manifest key, manifest length, shared chain.
-type CachedChain = Option<(String, u64, Arc<chain::Chain>)>;
+/// The cached chain triple: manifest stamp, shared chain. The stamp is
+/// the manifest's file metadata (length plus modification time), which
+/// the hot path compares without opening the file. A manifest write goes
+/// through a fresh temporary file and a rename, and the rename carries
+/// the temporary's just-created modification time, so every successful
+/// save moves the stamp; two saves cannot share a timestamp because the
+/// fsync between them costs far more than a filesystem timestamp tick.
+/// A false hit would therefore require two different manifests of equal
+/// length produced within one timestamp tick, which the write path makes
+/// impossible in practice.
+type CachedChain = Option<((u64, SystemTime), Arc<chain::Chain>)>;
 
 /// In-memory chain cache shared by RPC handlers and the FFI layer.
 /// Repeated queries reuse the same [`Arc`] instead of re-reading and
@@ -63,24 +73,15 @@ static CHAIN_CACHE: OnceLock<RwLock<CachedChain>> = OnceLock::new();
 /// between ticks are smoothed without unbounded growth.
 static PENDING_TXS: OnceLock<Mutex<Vec<chain::Tx>>> = OnceLock::new();
 
-/// Build the cache key for the in-memory chain cache. The key is the
-/// manifest's content identity — file length plus a short content digest —
-/// so any on-disk change invalidates the cached chain without an mtime
-/// race. The manifest path is resolved against the library data
-/// directory, so a node anchored with `slash_init` keys its cache on the
-/// manifest inside its own base. Returns `None` when no manifest exists
-/// yet.
-fn manifest_key() -> Option<(String, u64)> {
+/// Read the manifest's metadata stamp: file length and modification time.
+/// This is the only disk touch on the hot path of [`cached_load`], so a
+/// cache hit costs one `stat` instead of a full file read plus a hash.
+/// Returns `None` when no manifest exists yet.
+fn manifest_stamp() -> Option<(u64, SystemTime)> {
     let path = crate::storage::data_path("manifest.bin");
     let md = std::fs::metadata(&path).ok()?;
-    let len = md.len();
-    let content = std::fs::read(&path).ok()?;
-    let digest = blake3::hash(&content);
-    let mut key = String::with_capacity(16);
-    for b in digest.as_bytes()[..8].iter() {
-        key.push_str(&format!("{:02x}", b));
-    }
-    Some((key, len))
+    let mtime = md.modified().ok()?;
+    Some((md.len(), mtime))
 }
 
 /// Hex-decode a 32-byte key from its string form. Malformed hex and
@@ -136,27 +137,28 @@ fn active_chain_id() -> Vec<u8> {
     }
 }
 
-/// Load the chain through the in-memory cache. Returns a shared reference so
-/// that repeated RPC and FFI queries do not touch disk or duplicate memory.
-/// The cache is invalidated whenever the manifest content changes on disk.
+/// Load the chain through the in-memory cache. Returns a shared reference
+/// so that repeated RPC and FFI queries do not duplicate memory. The hot
+/// path compares the manifest's metadata stamp and returns the cached
+/// chain on a match; a miss reloads the chain from disk and re-stamps
+/// the cache. The stamp is sampled again after the load, so a manifest
+/// written while the load was in flight is picked up by the next call.
 pub fn cached_load() -> Arc<chain::Chain> {
     let cache = CHAIN_CACHE.get_or_init(|| RwLock::new(None));
-    let key = manifest_key();
+    let stamp = manifest_stamp();
     if let Ok(guard) = cache.read() {
-        if let Some((k, len, chain)) = &*guard {
-            if key
-                .as_ref()
-                .is_some_and(|(key_string, key_len)| key_string == k && *key_len == *len)
-            {
+        if let Some((cached_stamp, chain)) = &*guard {
+            if stamp.as_ref().is_some_and(|s| s == cached_stamp) {
                 return Arc::clone(chain);
             }
         }
     }
     let chain = Arc::new(load());
+    let stamp = manifest_stamp();
     if let Ok(mut guard) = cache.write() {
-        match key {
-            Some((k, len)) => *guard = Some((k, len, Arc::clone(&chain))),
-            // Without a manifest there is no stable key; keep the cache empty.
+        match stamp {
+            Some(s) => *guard = Some((s, Arc::clone(&chain))),
+            // Without a manifest there is no stable stamp; keep the cache empty.
             None => *guard = None,
         }
     }

@@ -48,12 +48,12 @@ impl Node {
     /// Serve one inbound request from local state, or refuse it under
     /// the request bucket. The request channel is the most expensive
     /// per-message surface of the node — a single GetBlocks serializes
-    /// up to 64 blocks — so every inbound request spends tokens priced
-    /// by serving cost. A refused request gets an empty Ack; a peer that
-    /// keeps pressing against the bucket past three consecutive refusals
-    /// records a strike, while one admitted request clears the count, so
-    /// honest sync is never punished and only sustained draining climbs
-    /// the ban ladder.
+    /// up to eight full blocks — so every inbound request spends tokens
+    /// priced by serving cost. A refused request gets an empty Ack; a
+    /// peer that keeps pressing against the bucket past three consecutive
+    /// refusals records a strike, while one admitted request clears the
+    /// count, so honest sync is never punished and only sustained
+    /// draining climbs the ban ladder.
     async fn serve_request(&mut self, peer: PeerId, req: Req) -> Resp {
         use super::super::limits::*;
         let cost = match &req {
@@ -104,7 +104,7 @@ impl Node {
                         break;
                     }
                     out.push(self.chain.blocks[idx].clone());
-                    if out.len() >= 64 {
+                    if out.len() >= SYNC_BLOCKS_PER_RESPONSE {
                         break;
                     }
                 }
@@ -128,11 +128,9 @@ impl Node {
                 Resp::Headers(out)
             }
             Req::GetOnionKey => {
-                // The legacy unauthenticated answer is retained as a
-                // fallback for peers that predate the attestation scheme.
-                // The requester's identity proves nothing here, so the
-                // routing table is left untouched: only keys verified on
-                // the response side ever populate it.
+                // The legacy request is still answered for old peers, but
+                // the response is never inserted into the local routing
+                // table because it carries no identity attestation.
                 Resp::OnionKey(self.onion_public())
             }
             Req::GetOnionKeyV2(nonce) => {
@@ -233,18 +231,12 @@ impl Node {
                 }
             }
             Resp::Block(_) => {}
-            Resp::OnionKey(key) => {
-                // Legacy unauthenticated key: usable only as a fallback
-                // when no attested key exists for the peer. A low-order
-                // key would make every envelope routed through it
-                // readable by anyone, so the probe is applied here too;
-                // an unusable key is skipped without touching reputation,
-                // because the legacy path carries no attestation at all.
-                let probe = x25519_dalek::StaticSecret::from(self.onion_secret());
-                if crate::crypto::x25519_shared(&probe, &key).is_some() {
-                    self.onion_keys.entry(peer).or_insert(key);
-                    self.onion_key_to_peer.entry(key).or_insert(peer);
-                }
+            Resp::OnionKey(_) => {
+                // Legacy unauthenticated keys are never trusted: without an
+                // identity signature over the challenge nonce, the answer
+                // cannot be bound to the peer, so routing through it would
+                // let a man in the middle substitute the relay key. Only
+                // the attested response below may populate either table.
             }
             Resp::OnionKeyV2(nonce, key, sig) => {
                 // The response must answer the exact challenge issued at

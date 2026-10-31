@@ -168,7 +168,7 @@ impl Chain {
     /// block one above the tip is admitted only when it extends a
     /// retained side fork; anything higher waits for its parent instead
     /// of entering the competition early.
-    pub(crate) fn validate_side_fork_entry(&self, block: &Block) -> bool {
+    pub fn validate_side_fork_entry(&self, block: &Block) -> bool {
         if block.height == 0 {
             return false;
         }

@@ -3,10 +3,13 @@
 //! The call returns a boolean, so every input is bounded before any work
 //! happens: the sibling array is capped before decoding, the leaf index
 //! must fit the platform's usize, and every malformed string is refused
-//! with a zero. The verification itself is the same fold the light-client
-//! guide documents.
+//! with a zero. The body runs inside the same panic guard as the other
+//! entry points: a panic here converts to a plain "proof invalid" verdict
+//! instead of unwinding across the language boundary and aborting the
+//! embedding process. Verification itself is the same fold the
+//! light-client guide documents.
 
-use super::{decode_hex_ptr, MAX_PROOF_SIBLINGS};
+use super::{decode_hex_ptr, ffi_guard, MAX_PROOF_SIBLINGS};
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_int, c_ulonglong};
 
@@ -29,50 +32,53 @@ pub unsafe extern "C" fn slash_verify_page_proof(
     leaf_index: c_ulonglong,
     siblings_json: *const c_char,
 ) -> c_int {
-    if hex_root.is_null() || hex_leaf_hash.is_null() || siblings_json.is_null() {
-        return 0;
-    }
-    let Ok(leaf_index) = usize::try_from(leaf_index) else {
-        return 0;
-    };
-    let root = match decode_hex_ptr(hex_root) {
-        Ok(r) => r,
-        Err(_) => return 0,
-    };
-    let leaf_hash = match decode_hex_ptr(hex_leaf_hash) {
-        Ok(l) => l,
-        Err(_) => return 0,
-    };
-    let siblings_str = match unsafe { CStr::from_ptr(siblings_json) }.to_str() {
-        Ok(s) => s,
-        Err(_) => return 0,
-    };
-    let siblings_vec: Vec<String> = match serde_json::from_str(siblings_str) {
-        Ok(v) => v,
-        Err(_) => return 0,
-    };
-    // Bound the work before decoding: the page tree is at most 16 levels
-    // deep, so anything past the cap is malformed on any honest chain.
-    if siblings_vec.len() > MAX_PROOF_SIBLINGS {
-        return 0;
-    }
-    let mut siblings = Vec::with_capacity(siblings_vec.len());
-    for s in siblings_vec {
-        match crate::decode_key(&s) {
-            Ok(h) => siblings.push(h),
-            Err(_) => return 0,
+    ffi_guard(0, move || {
+        if hex_root.is_null() || hex_leaf_hash.is_null() || siblings_json.is_null() {
+            return 0;
         }
-    }
+        let Ok(leaf_index) = usize::try_from(leaf_index) else {
+            return 0;
+        };
+        let root = match decode_hex_ptr(hex_root) {
+            Ok(r) => r,
+            Err(_) => return 0,
+        };
+        let leaf_hash = match decode_hex_ptr(hex_leaf_hash) {
+            Ok(l) => l,
+            Err(_) => return 0,
+        };
+        let siblings_str = match unsafe { CStr::from_ptr(siblings_json) }.to_str() {
+            Ok(s) => s,
+            Err(_) => return 0,
+        };
+        let siblings_vec: Vec<String> = match serde_json::from_str(siblings_str) {
+            Ok(v) => v,
+            Err(_) => return 0,
+        };
+        // Bound the work before decoding: the page tree is at most 16
+        // levels deep, so anything past the cap is malformed on any
+        // honest chain.
+        if siblings_vec.len() > MAX_PROOF_SIBLINGS {
+            return 0;
+        }
+        let mut siblings = Vec::with_capacity(siblings_vec.len());
+        for s in siblings_vec {
+            match crate::decode_key(&s) {
+                Ok(h) => siblings.push(h),
+                Err(_) => return 0,
+            }
+        }
 
-    let proof = crate::state::PageProof {
-        leaf_hash,
-        siblings,
-        leaf_index,
-    };
+        let proof = crate::state::PageProof {
+            leaf_hash,
+            siblings,
+            leaf_index,
+        };
 
-    if crate::state::verify_page_proof(&root, &proof) {
-        1
-    } else {
-        0
-    }
+        if crate::state::verify_page_proof(&root, &proof) {
+            1
+        } else {
+            0
+        }
+    })
 }

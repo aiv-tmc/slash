@@ -4,8 +4,8 @@
 //! that carries the main-chain prefix and the fork-point state, and
 //! retained in the bounded side-fork pool until it accumulates strictly
 //! more work than the main chain over the contested span. Adoption
-//! itself lives in `reorg.rs`, ingress dispatch in `ingress.rs`, and
-//! the orphan pool in `orphans.rs`.
+//! itself lives in `reorg.rs`, ingress dispatch in `ingress.rs`, and the
+//! orphan pool in `orphans.rs`.
 
 use super::chain::Chain;
 use super::types::{Block, BlockError};
@@ -26,15 +26,25 @@ impl Chain {
     /// main-chain rules.
     pub(crate) fn validate_fork_chain(&self, fork_tip: &Block) -> Result<Vec<Block>, BlockError> {
         // Walk the fork backwards from its tip through the retained pool
-        // until the block that extends the main chain is reached.
+        // until the block that extends the main chain is reached. A block
+        // one above the base height connects either to the retained base
+        // block through the first stored block's `prev` hash, or, at a
+        // genesis base, to the implicit all-zero genesis parent.
         let mut fork = vec![fork_tip.clone()];
         loop {
             let head = fork.last().expect("the fork always has a head");
+            let parent_height = head.height.saturating_sub(1);
             let connects_main = head.height > self.base_height
-                && self
-                    .get_block(head.height - 1)
-                    .map(|b| self.block_hash(b) == head.prev)
-                    .unwrap_or(false);
+                && if parent_height == self.base_height {
+                    self.blocks
+                        .first()
+                        .map(|first| first.prev == head.prev)
+                        .unwrap_or(head.prev == [0u8; 32])
+                } else {
+                    self.get_block(parent_height)
+                        .map(|parent| self.block_hash(parent) == head.prev)
+                        .unwrap_or(false)
+                };
             if connects_main {
                 break;
             }
@@ -55,12 +65,15 @@ impl Chain {
         if fork_point < self.base_height {
             return Err(BlockError::CannotReorgBeyondHistory);
         }
-        // The retained vector holds the blocks ABOVE the base height, with
-        // the block at height h sitting at index h - base - 1, so the
-        // prefix through the fork point holds exactly fork_point - base
-        // blocks: the cursor tip must be the fork point itself, making
-        // the first fork block the cursor's tip-plus-one.
+        // The retained vector holds the blocks ABOVE the base height,
+        // with the block at height h sitting at index h - base - 1, so
+        // the prefix through the fork point holds exactly fork_point -
+        // base blocks: the cursor tip must be the fork point itself,
+        // making the first fork block the cursor's tip-plus-one.
         let prefix_len = (fork_point - self.base_height) as usize;
+        // The fork-point state is a shared snapshot from the reorg
+        // window: the cursor adopts the same `Arc`, so validating a
+        // fork never copies the state.
         let fork_point_state = self
             .state_history
             .get(&fork_point)
@@ -80,16 +93,16 @@ impl Chain {
             chain_id: self.chain_id.clone(),
             testnet: self.testnet,
         };
-        for b in &fork {
+        for block in &fork {
             // Header validation against the cursor: height sequence,
             // previous-hash linkage, median time over the cursor's last
             // eleven blocks, and the retargeted difficulty schedule.
-            cursor.check_block_meta(b)?;
+            cursor.check_block_meta(block)?;
             // Speculative execution enforces coinbase shape, treasury
             // pairing, transaction validity, governance rules, and PoW.
-            let temp = cursor.execute_block_state(&cursor.state, b)?;
-            cursor.blocks.push(b.clone());
-            cursor.state = temp;
+            let temp = cursor.execute_block_state(&cursor.state, block)?;
+            cursor.blocks.push(block.clone());
+            cursor.state = std::sync::Arc::new(temp);
         }
         Ok(fork)
     }

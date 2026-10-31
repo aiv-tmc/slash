@@ -1,11 +1,12 @@
-//! src/chain/execution/mod.rs — the block execution pipeline.
+//! The block execution pipeline.
 //!
-//! One speculative `State` clone runs the whole block: the proof-of-work
-//! slot mint and coinbase (in `meta`), every transaction with the treasury
-//! pairing gates on both sides of the bonding curve (in `txs`), governance
-//! close/execute, and finally the page-root recomputation against the
-//! block's commitments. Only a fully passing speculative state is ever
-//! committed, so a failing block leaves the live chain untouched.
+//! One speculative `State` clone runs the whole block: the
+//! proof-of-work slot mint and coinbase (in `meta`), every transaction
+//! with the treasury pairing gates on both sides of the bonding curve
+//! (in `txs`), governance close/execute, and finally the page-root
+//! recomputation against the block's commitments. Only a fully passing
+//! speculative state is ever committed, so a failing block leaves the
+//! live chain untouched.
 //!
 //! Layout:
 //! - `meta` — header/slot validation and the coinbase mint
@@ -20,13 +21,13 @@ use crate::state;
 
 impl Chain {
     /// Execute a block against a state and return the post-state, running
-    /// every consensus rule in order: coinbase shape, proof-of-work slot
-    /// assignment, transaction execution with treasury pairing, the
-    /// governance tally and execution, and finally the page-root
-    /// recomputation against the block's commitments. Every adoption path
-    /// — main extension, fork validation, reorg rehearsal — calls this
-    /// single entry point, so the executed transition is identical no
-    /// matter how the block arrived.
+    /// every consensus rule in order: coinbase shape, proof-of-work
+    /// slot assignment, transaction execution with treasury pairing,
+    /// the governance tally and execution, and finally the page-root
+    /// recomputation against the block's commitments. Every adoption
+    /// path — main extension, fork validation, reorg rehearsal — calls
+    /// this single entry point, so the executed transition is identical
+    /// no matter how the block arrived.
     pub fn execute_block_state(
         &self,
         state: &crate::state::State,
@@ -35,21 +36,23 @@ impl Chain {
         let mut temp = state.clone();
         self.execute_block_meta_inner(&mut temp, block)?;
         self.execute_block_txs(&mut temp, block)?;
-        // After all transactions, close any proposals whose voting period
-        // ends at this height, execute proposals whose scheduled height
-        // has arrived, and persist the resulting governance state. The
-        // quorum denominator rides each proposal since its submission, so
-        // the close pass performs no ledger scans. The dao is swapped out
-        // while it runs so the close pass (which reads the state) and the
-        // execute pass (which mutates it) never hold overlapping borrows.
+        // After all transactions, close any proposals whose voting
+        // period ends at this height, execute proposals whose scheduled
+        // height has arrived, and persist the resulting governance
+        // state. The quorum denominator rides each proposal since its
+        // submission, so the close pass performs no ledger scans. The dao
+        // is swapped out while it runs so the close pass (which reads
+        // the state) and the execute pass (which mutates it) never hold
+        // overlapping borrows.
         let mut dao = std::mem::replace(&mut temp.dao, crate::dao::DaoState::genesis());
         dao.close_due(block.height);
         dao.execute_due(&mut temp, block.height);
         temp.dao = dao;
         // Recompute every dirty-page Merkle root and compare it with the
-        // block's commitment. A mismatch means the block's recorded state
-        // transition is not the one the local engine executed, so the
-        // block is rejected before any external observer can rely on it.
+        // block's commitment. A mismatch means the block's recorded
+        // state transition is not the one the local engine executed, so
+        // the block is rejected before any external observer can rely on
+        // it.
         for (&page_id, page) in &temp.pages {
             let expected = page.merkle_root();
             match block.page_roots.get(&page_id) {
@@ -73,7 +76,9 @@ impl Chain {
     /// and governance passes the committed path runs.
     pub fn execute_block_meta(&self, block: &Block) -> Result<(), BlockError> {
         self.check_block_meta(block)?;
-        let mut temp = self.state.clone();
+        // The chain state is shared; the speculative copy detaches the
+        // value from the `Arc` so the pipeline can mutate it freely.
+        let mut temp = (*self.state).clone();
         self.execute_block_meta_inner(&mut temp, block)?;
         self.execute_block_txs(&mut temp, block)?;
         // Close and execute due governance work exactly as
@@ -87,10 +92,10 @@ impl Chain {
 
     /// Prepare a candidate block for validation: execute it speculatively
     /// against the tip state and record the resulting dirty-page Merkle
-    /// roots into the block's page-root commitment map. Mining calls this
-    /// after filling transactions, fee claims, nonce, and slot cell so
-    /// the template carries the roots validation will recompute and
-    /// compare.
+    /// roots into the block's page-root commitment map. Mining calls
+    /// this after filling transactions, fee claims, nonce, and slot
+    /// cell so the template carries the roots validation will
+    /// recompute and compare.
     ///
     /// The speculative run deliberately skips the page-root comparison:
     /// a candidate cannot carry roots before they are computed, so
@@ -100,7 +105,9 @@ impl Chain {
     /// pages, so a template that fails any gate keeps its previous roots
     /// and fails validation downstream exactly as before.
     pub fn prepare_block(&self, mut block: Block) -> Block {
-        let mut temp = self.state.clone();
+        // The chain state is shared; the speculative copy detaches the
+        // value from the `Arc` so the pipeline can mutate it freely.
+        let mut temp = (*self.state).clone();
         let executed = self
             .execute_block_meta_inner(&mut temp, &block)
             .and_then(|()| self.execute_block_txs(&mut temp, &block))
@@ -121,10 +128,10 @@ impl Chain {
         block
     }
 
-    /// Convert chain-level transaction outputs into the state-level output
-    /// type. The two `Output` structs carry identical fields; the state
-    /// engine owns the canonical form because every signature hash is
-    /// computed over it.
+    /// Convert chain-level transaction outputs into the state-level
+    /// output type. The two `Output` structs carry identical fields; the
+    /// state engine owns the canonical form because every signature
+    /// hash is computed over it.
     pub(crate) fn to_state_outputs(outputs: &[Output]) -> Vec<state::Output> {
         outputs
             .iter()

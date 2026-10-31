@@ -166,7 +166,7 @@ mod tests {
         // An extra cache entry tips the supply past N without any cell
         // existing behind it: the mirror is inconsistent with the ledger.
         let mut chain = chain::Chain::genesis();
-        chain.state.balance_cache.insert([7u8; 32], 1);
+        chain.state_mut().balance_cache.insert([7u8; 32], 1);
         let err =
             sanity_check(&chain).expect_err("a broken conservation invariant must be refused");
         assert!(

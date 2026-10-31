@@ -15,7 +15,7 @@ impl Chain {
     /// the pool regardless of outcome, so a permanently invalid block
     /// cannot retry forever. Pool entries pair the block with its
     /// serialized size, so the adopted value discards the size pair.
-    pub(crate) fn process_orphans(&mut self) -> usize {
+    pub fn process_orphans(&mut self) -> usize {
         let mut adopted = 0usize;
         let keys: Vec<[u8; 32]> = self.orphan_blocks.keys().copied().collect();
         for key in keys {

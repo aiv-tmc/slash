@@ -38,7 +38,9 @@ impl super::chain::Chain {
             let last_diff = self.blocks[window_end - 1].difficulty;
             let actual = end_time.saturating_sub(start_time).max(1) as u128;
             let target = (DIFFICULTY_ADJUSTMENT_INTERVAL * TARGET_BLOCK_TIME_SECS) as u128;
-            let raw = (last_diff as u128).saturating_mul(target).saturating_div(actual);
+            let raw = (last_diff as u128)
+                .saturating_mul(target)
+                .saturating_div(actual);
             // The clamps run in u128: on a pathological window the raw
             // rescale can exceed u64 range, and a truncating cast would
             // wrap the value before the clamp could act on it. Clamping

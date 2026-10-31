@@ -1,5 +1,6 @@
-//! Entry-gate tests: side-fork admission, orphan adoption bounds, and the
-//! recovery replay's linkage stop.
+//! Entry-gate tests: side-fork admission, orphan adoption bounds, the
+//! recovery replay's linkage stop, and the per-block lock pruning that
+//! keeps runtime and freshly-loaded selection identical.
 
 use super::*;
 use crate::chain::*;
@@ -83,4 +84,38 @@ fn apply_recovered_rejects_broken_linkage() {
     let b2 = build_block_extending(&chain, chain.tip_hash(), b1.height + 1, miner);
     let b2 = chain.prepare_block(b2);
     chain.apply_recovered(b2).expect("linked recovery applies");
+}
+
+#[test]
+fn block_execution_prunes_expired_lock_registrations() {
+    // A lock registration whose expiry is at or below the executing
+    // height leaves both lock maps at the start of every block
+    // execution: canonical selection, ownership scans, and governance
+    // weight see exactly what a freshly loaded chain would see at the
+    // same height, so long-running and restarted nodes cannot diverge.
+    let mut chain = Chain::genesis();
+    let miner = [7u8; 32];
+    // A registration expiring at height 1, written directly into the
+    // live maps exactly as the engine would have committed it.
+    {
+        let state = std::sync::Arc::make_mut(&mut chain.state);
+        state.locks.insert(500, 1);
+        state.lock_created.insert(500, 0);
+    }
+    // The height-1 block retires the expired registration from both
+    // maps; the live map is a pure function of the height afterwards.
+    mine_tip_block(&mut chain, miner);
+    assert!(!chain.state.locks.contains_key(&500));
+    assert!(!chain.state.lock_created.contains_key(&500));
+    // A registration whose expiry lies above the executing height
+    // survives the same pass untouched.
+    let live_expiry = chain.tip_height() + 10;
+    {
+        let state = std::sync::Arc::make_mut(&mut chain.state);
+        state.locks.insert(600, live_expiry);
+        state.lock_created.insert(600, 0);
+    }
+    mine_tip_block(&mut chain, miner);
+    assert!(chain.state.locks.contains_key(&600));
+    assert!(chain.state.lock_created.contains_key(&600));
 }

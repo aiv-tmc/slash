@@ -20,6 +20,18 @@ impl Chain {
         temp: &mut crate::state::State,
         block: &Block,
     ) -> Result<(), BlockError> {
+        // Retire every lock registration whose expiry is at or below the
+        // executing height before anything in this block reads the maps:
+        // after this pass the maps hold exactly the live registrations,
+        // which is what a freshly loaded chain would hold at the same
+        // height. Canonical selection, ownership scans, and governance
+        // weight therefore agree between long-running and restarted
+        // nodes, and dead registrations can never accumulate across a
+        // session. The prune is a pure function of the maps and the
+        // height, so every execution path — main extension, fork
+        // validation, reorg rehearsal, recovery replay — performs it at
+        // exactly the same point.
+        temp.prune_locks(block.height);
         // Active soft-fork rules bind every execution path — main-chain
         // extension, fork validation, and recovery replay — because they
         // are enforced inside this single header-execution entry point

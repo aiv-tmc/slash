@@ -16,7 +16,7 @@ use super::limits::MAX_FRAME;
 
 /// The request-response protocol name negotiated during the libp2p
 /// handshake. Versioned so incompatible wire revisions refuse to connect.
-const REQ_RESP_PROTOCOL: &str = "/slash/req-resp/0.4.2";
+const REQ_RESP_PROTOCOL: &str = "/slash/req-resp/0.6.0";
 
 /// Protocol identifier negotiated for the request-response stream upgrade.
 /// The request-response behaviour names its protocol as a string; the
@@ -64,7 +64,19 @@ where
 {
     let payload = bincode::serialize(value)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    io.write_all(&(payload.len() as u32).to_le_bytes()).await?;
+    if payload.len() > MAX_FRAME {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "serialized response exceeds the maximum frame size",
+        ));
+    }
+    let len = u32::try_from(payload.len()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "frame length does not fit u32",
+        )
+    })?;
+    io.write_all(&len.to_le_bytes()).await?;
     io.write_all(&payload).await?;
     io.flush().await?;
     Ok(())

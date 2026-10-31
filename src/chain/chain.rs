@@ -6,11 +6,19 @@
 //! and orphan pools, and the version-bit deployment table. Methods live in
 //! the sibling files grouped by responsibility; this file owns the struct
 //! and the genesis constructors only.
+//!
+//! The state and the history entries ride behind `Arc`: block execution
+//! is a pure function returning a fresh post-state, so the commit path
+//! installs one `Arc` and the history records the same `Arc` — a
+//! reference-count bump instead of a deep copy per block, and a cheap
+//! snapshot share for fork rehearsal, reorg rehearsal, and drill-style
+//! harnesses that clone whole chains.
 
 use super::params::{MAINNET_ID, TESTNET_ID};
 use super::types::Block;
 use super::version_bits::{Deployment, VersionBits};
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 /// The chain: an ordered vector of blocks above `base_height`, the
 /// materialized state at the tip, a bounded history of states for reorgs,
@@ -19,8 +27,17 @@ use std::collections::{BTreeMap, HashMap};
 pub struct Chain {
     pub blocks: Vec<Block>,
     pub base_height: u64,
-    pub state: crate::state::State,
-    pub state_history: HashMap<u64, crate::state::State>,
+    /// The current ledger state — the post-state of the tip block. Shared
+    /// behind an `Arc`: readers dereference transparently, and the few
+    /// legitimate in-place mutations (load-time pruning, fixture seeding)
+    /// go through `state_mut`/`Arc::make_mut`, which writes in place while
+    /// the reference is unique.
+    pub state: Arc<crate::state::State>,
+    /// The post-state of every block inside the reorg window, keyed by
+    /// height. Values are shared `Arc`s: recording history is a
+    /// reference-count bump on the state the chain just installed, not a
+    /// copy.
+    pub state_history: HashMap<u64, Arc<crate::state::State>>,
     pub deployments_history: HashMap<u64, Vec<Deployment>>,
     pub checkpoints: BTreeMap<u64, [u8; 32]>,
     /// Competing branches the chain has validated but not adopted, keyed
@@ -72,8 +89,12 @@ impl Chain {
             ),
             "genesis mint"
         );
+        // The freshly built state becomes the shared tip state: the
+        // history records the same allocation, so genesis pays one state
+        // build and zero copies.
+        let state = Arc::new(state);
         let mut state_history = HashMap::new();
-        state_history.insert(0, state.clone());
+        state_history.insert(0, Arc::clone(&state));
         let mut chain = Self {
             blocks: Vec::new(),
             base_height: 0,
@@ -126,5 +147,15 @@ impl Chain {
             .last()
             .map(|b| self.block_hash(b))
             .unwrap_or([0u8; 32])
+    }
+
+    /// Exclusive mutable access to the tip state for fixture seeding and
+    /// operator tooling. Every legitimate caller owns its chain uniquely,
+    /// so the write goes through `Arc::make_mut` in place; a shared
+    /// reference would clone, and the seeding call sites are exactly the
+    /// ones that can afford an in-place write but not an accidental deep
+    /// copy of the whole ledger.
+    pub fn state_mut(&mut self) -> &mut crate::state::State {
+        Arc::make_mut(&mut self.state)
     }
 }

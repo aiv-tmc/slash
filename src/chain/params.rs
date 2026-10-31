@@ -8,11 +8,11 @@
 /// other, which is the replay isolation between networks. The identifier
 /// tracks the crate version and changes whenever consensus behavior
 /// changes, per the project's network-identifier policy.
-pub const MAINNET_ID: &str = "/slash/0.5.0";
+pub const MAINNET_ID: &str = "/slash/0.6.0";
 
 /// The testnet network identifier, distinct from the mainnet identifier
 /// for the same replay-isolation reason.
-pub const TESTNET_ID: &str = "/slash/test/0.5.0";
+pub const TESTNET_ID: &str = "/slash/test/0.6.0";
 
 /// Initial coinbase subsidy at genesis height (era 0), in cells.
 pub const SUBSIDY_INITIAL: u64 = 500;

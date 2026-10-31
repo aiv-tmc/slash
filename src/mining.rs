@@ -7,7 +7,8 @@
 //!
 //! The miner constructs hash inputs through the shared `chain::pow_input`
 //! builder — the same function the verifier uses — so a nonce that
-//! satisfies the difficulty target is valid consensus-wide by construction.
+//! satisfies the difficulty target is valid consensus-wide by
+//! construction.
 
 use rust_randomx::{Context, Hasher as RandomXHasher};
 use std::collections::HashMap;
@@ -34,54 +35,88 @@ struct CachedContext {
 static CONTEXT_CACHE: OnceLock<std::sync::Mutex<HashMap<[u8; 32], CachedContext>>> =
     OnceLock::new();
 
+/// Serializes the heavy part of context creation. A fresh RandomX context
+/// pins hundreds of megabytes, and creating several concurrently —
+/// parallel header verification during a sync flood — would multiply the
+/// node's memory by the thread count and can push a memory-bound node
+/// into OOM. Cache hits never wait on this lock, and a second cache
+/// check inside it turns a queued creator into a cheap hit when another
+/// thread built the same context first.
+static CONTEXT_CREATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// How long a cached context stays alive after its last use.
 const CONTEXT_CACHE_TTL: Duration = Duration::from_secs(600);
-/// Maximum number of cached RandomX contexts. Each context pins a large
-/// memory allocation, so the count is bounded in addition to the TTL: a peer
-/// streaming headers with random prev hashes must not be able to exhaust
-/// node memory by forcing the creation of unbounded contexts.
-const MAX_CONTEXT_CACHE_ENTRIES: usize = 8;
+/// Maximum number of cached RandomX contexts. A light context pins the
+/// ~256 MiB RandomX cache and a full context pins the ~2 GiB dataset, so
+/// the count is bounded in addition to the TTL: a peer streaming headers
+/// with random prev hashes must not be able to exhaust node memory by
+/// forcing the creation of unbounded contexts, and a long sequential run
+/// of distinct parents — a simulation sweep or a fast initial sync —
+/// must stay inside a small-RAM machine's budget too. Three entries cap
+/// the live cache at roughly three-quarters of a gigabyte while still
+/// covering the mining tip plus a verification context: the eviction
+/// policy below recycles verification entries among themselves, so
+/// header-sync traffic keeps one slot warm instead of evicting the
+/// mining dataset.
+const MAX_CONTEXT_CACHE_ENTRIES: usize = 3;
 
 /// Hash evaluations between wall-clock refreshes inside the nonce loops.
 /// The proof-of-work input binds the one-second-resolution timestamp, so a
 /// search that outlives its starting second keeps hashing an input the
-/// consensus clock has already moved past. The interval is sized against
-/// the expected per-hash cost: frequent enough that the stamped time never
-/// lags the wall clock, rare enough that the clock read stays noise.
-const TIME_REFRESH_INTERVAL: u64 = 1 << 16;
+/// consensus clock has already moved past. At kilohash-scale RandomX
+/// mining rates this interval re-stamps about once per second: the
+/// stamped time stays within a block interval of the wall clock, and
+/// the clock read stays off the per-hash hot path.
+const TIME_REFRESH_INTERVAL: u64 = 1024;
 
 /// Retrieve a cached RandomX Context for the given prev hash, creating one
-/// when no live entry exists. `full_mem` must be true for mining and may be
-/// false for verification. Eviction prefers light verification contexts —
-/// they are cheap to rebuild, while evicting a full mining context forces a
-/// large reallocation before the next mining attempt can hash a single
-/// nonce, so header-sync verification traffic recycles verification entries
+/// when no live entry exists. `full_mem` must be true for mining and may
+/// be false for verification. A light request is served by any live
+/// entry; a full request is served only by an entry holding the full
+/// dataset, and otherwise recreates the entry with the full dataset.
+/// Eviction prefers light verification contexts — they are cheap to
+/// rebuild, while evicting a full mining context forces a large
+/// reallocation before the next mining attempt can hash a single nonce —
+/// so header-sync verification traffic recycles verification entries
 /// among themselves without displacing the mining tip's dataset.
 pub fn get_context(prev: &[u8; 32], full_mem: bool) -> Arc<Context> {
     let key = blake3::hash(prev).into();
     let now = Instant::now();
 
-    // Refresh and return a live entry when one exists. A light entry cannot
-    // serve a mining request, so full requests miss on light entries and
-    // recreate them with the full dataset.
+    // Fast path: refresh and return a live entry when one exists and is
+    // full enough for the request.
     let cache = CONTEXT_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
     if let Some(entry) = cache.lock().unwrap().get_mut(&key) {
-        let full_enough = !full_mem;
+        let full_enough = !full_mem || entry.full_mem;
         if full_enough && now.duration_since(entry.last_used) <= CONTEXT_CACHE_TTL {
             entry.last_used = now;
             return Arc::clone(&entry.context);
         }
     }
 
-    // Create a fresh context. Light contexts are preferred for verification
-    // because they use far less memory; mining always needs the full dataset.
-    let ctx = Arc::new(Context::new(prev, full_mem));
+    // Slow path: allocate under the creation lock so concurrent misses
+    // serialize their heavy allocations. A second cache check inside the
+    // lock converts a queued creator into a cheap hit when another
+    // thread built this exact context while we were waiting.
+    let ctx = {
+        let _permit = CONTEXT_CREATE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = cache.lock().unwrap().get_mut(&key) {
+            let full_enough = !full_mem || entry.full_mem;
+            if full_enough && now.duration_since(entry.last_used) <= CONTEXT_CACHE_TTL {
+                entry.last_used = Instant::now();
+                return Arc::clone(&entry.context);
+            }
+        }
+        Arc::new(Context::new(prev, full_mem))
+    };
 
-    let mut cache = cache.lock().unwrap();
     // Enforce the entry-count bound before inserting. The victim is the
     // least recently used light context when one exists, falling back to
     // plain least-recently-used order only when the cache holds
     // exclusively full contexts.
+    let mut cache = cache.lock().unwrap();
     if cache.len() >= MAX_CONTEXT_CACHE_ENTRIES {
         let victim = cache
             .iter()
@@ -114,14 +149,17 @@ pub struct MinerBlock {
     pub time: u64,
 }
 
-/// Search for a valid nonce in parallel across all available cores.
-/// Each worker strides nonces by the worker count so no two workers evaluate
-/// the same candidate, and every call draws a fresh random nonce base so two
-/// searches that start within the same wall-clock second — the common case
-/// for a retry after a stale-time rejection — cover disjoint subspaces with
-/// overwhelming probability instead of rescanning the identical sequence.
-/// The search stops as soon as any worker satisfies the difficulty target,
-/// finds an acceptable proof-of-work slot, or observes the cancellation flag.
+/// Search for a valid nonce in parallel across `threads` worker threads.
+/// Each worker strides nonces by the worker count so no two workers
+/// evaluate the same candidate, and every call draws a fresh random
+/// nonce base so two searches that start within the same wall-clock
+/// second — the common case for a retry after a stale-time rejection —
+/// cover disjoint subspaces with overwhelming probability instead of
+/// rescanning the identical sequence. The search stops as soon as any
+/// worker satisfies the difficulty target and the slot predicate, or
+/// observes the shared cancellation or found flags. The winning worker
+/// publishes the timestamp it ground against so the caller stamps the
+/// block with a time the consensus clock actually accepts.
 pub fn mine_parallel(
     prev: [u8; 32],
     time: u64,
@@ -136,8 +174,8 @@ pub fn mine_parallel(
     let ctx = get_context(&prev, true);
     let found = Arc::new(AtomicBool::new(false));
     let (tx, rx) = std::sync::mpsc::channel::<MinerBlock>();
-    // Random base for this search call: overlapping invocations within one
-    // second no longer share a nonce sequence.
+    // Random base for this search call: overlapping invocations within
+    // one second no longer share a nonce sequence.
     let base = rand::random::<u64>();
     for i in 0..threads {
         let tx = tx.clone();
@@ -167,9 +205,9 @@ pub fn mine_parallel(
                 let u = u64::from_le_bytes(h[..8].try_into().unwrap());
                 let slot = u % crate::state::N;
                 if u % diff == 0 && slot_check(slot) {
-                    // Publish the winning block, signal the other workers,
-                    // and exit. The receiver may already have returned, in
-                    // which case the send result is ignored.
+                    // Publish the winning block, signal the other
+                    // workers, and exit. The receiver may already have
+                    // returned, in which case the send result is ignored.
                     found.store(true, Ordering::Relaxed);
                     let _ = tx.send(MinerBlock {
                         nonce,
@@ -186,11 +224,13 @@ pub fn mine_parallel(
     rx.recv().ok()
 }
 
-/// Synchronous single-threaded mining used by tests and the miner RPC path.
-/// `slot_check` lets the caller reject proof-of-work slots that target
-/// non-treasury cells without invalidating the whole search. The search
-/// starts from a random nonce and refreshes the timestamp from the wall
-/// clock; the returned block carries the time the proof was ground against.
+/// Synchronous single-threaded mining used by tests and the miner RPC
+/// path. `slot_check` lets the caller reject proof-of-work slots that
+/// target non-treasury cells without invalidating the whole search. The
+/// search starts from a random nonce so overlapping calls do not rewalk
+/// the same candidates, refreshes the timestamp periodically so a long
+/// search keeps hashing a consensus-current input, and returns the
+/// winning triple or None on cancellation.
 pub fn mine(
     prev: [u8; 32],
     time: u64,
@@ -230,13 +270,13 @@ pub fn mine(
     None
 }
 
-/// Header-only nonce search used by the P2P mining loop. Unlike `mine` and
-/// `mine_parallel` it accepts any proof-of-work slot cell because the block
-/// template's slot is validated against the treasury ownership table later,
-/// during full block validation. Returns the winning nonce, the slot cell
-/// derived from the hash output, and the timestamp the search ground
-/// against — which may be later than the template time when a long search
-/// advanced it — or None on cancellation.
+/// Header-only nonce search used by the P2P mining loop. Unlike `mine`
+/// and `mine_parallel` it accepts any proof-of-work slot cell because
+/// the block template's slot is validated against the treasury ownership
+/// table later, during full block validation. Returns the winning nonce,
+/// the slot cell derived from the hash output, and the timestamp the
+/// search ground against — which may be later than the template time
+/// when a long search advanced it — or None on cancellation.
 pub fn mine_block(
     prev: [u8; 32],
     time: u64,
@@ -249,20 +289,22 @@ pub fn mine_block(
     Some((found.nonce, found.value % crate::state::N, found.time))
 }
 
-/// Mining facade used by the P2P node. The node runs this blocking search on
-/// the thread-pool via `spawn_blocking` and receives a fully assembled block
-/// template whose transaction list and fee claims it fills in afterwards.
+/// Mining facade used by the P2P node. The node runs this blocking
+/// search on the thread-pool via `spawn_blocking` and receives a fully
+/// assembled block template whose transaction list and fee claims it
+/// fills in afterwards.
 pub struct Miner;
 
 impl Miner {
     /// Run the single-threaded nonce search and package the result into a
-    /// block template. `cancel` and `slot_check` are optional conveniences:
-    /// mining proceeds without cancellation, and without a slot predicate
-    /// every treasury-range solution is accepted. The block timestamp is
-    /// the wall clock at search start; the search advances it while it
-    /// runs, and the returned block is stamped with the time the winning
-    /// proof was ground against, keeping the header and the proof
-    /// consistent under the median-time and future-time rules.
+    /// block template. `cancel` and `slot_check` are optional
+    /// conveniences: mining proceeds without cancellation, and without a
+    /// slot predicate every treasury-range solution is accepted. The
+    /// block timestamp is the wall clock at search start; the search
+    /// advances it while it runs, and the returned block is stamped with
+    /// the time the winning proof was ground against, keeping the header
+    /// and the proof consistent under the median-time and future-time
+    /// rules.
     pub fn mine(
         prev: [u8; 32],
         height: u64,

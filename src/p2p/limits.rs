@@ -62,7 +62,7 @@ pub(crate) const ONION_BUCKET_BURST: f64 = 4.0;
 
 /// The request-class bucket: refills at one token per second up to a
 /// burst of eight. Request messages are strictly more expensive per unit
-/// than gossip — one GetBlocks serializes up to 64 blocks — so the
+/// than gossip — one GetBlocks serializes up to eight blocks — so the
 /// channel gets its own bucket sized to the honest sync profile: headers
 /// and tip polls are cheap and frequent, full block ranges are rare.
 pub(crate) const REQ_BUCKET_REFILL_PER_SEC: f64 = 1.0;
@@ -70,8 +70,8 @@ pub(crate) const REQ_BUCKET_BURST: f64 = 8.0;
 
 /// Per-request token costs inside the request bucket. The cost mirrors
 /// the serving work: a tip answer is one lookup, a single block is one
-/// serialization of up to 1 MiB, a block range is up to 64 of those, and
-/// a forwarded onion pays the envelope deserialization plus the peel.
+/// serialization of up to 1 MiB, a block range is up to eight of those,
+/// and a forwarded onion pays the envelope deserialization plus the peel.
 pub(crate) const REQ_COST_TIP: f64 = 1.0;
 pub(crate) const REQ_COST_BLOCK: f64 = 2.0;
 pub(crate) const REQ_COST_BLOCKS: f64 = 6.0;
@@ -109,10 +109,11 @@ pub(crate) const REQ_REFUSAL_STRIKE_THRESHOLD: u8 = 3;
 /// them.
 pub(crate) const SYNC_MAX_TIP_AHEAD: u64 = 20_160;
 
-/// The serving cap for one GetBlocks response. The sync loop requests
-/// the next chunk immediately after a full one, so this constant doubles
-/// as the loop's chunk detector.
-pub(crate) const SYNC_BLOCKS_PER_RESPONSE: usize = 64;
+/// The serving cap for one GetBlocks response. Eight maximum-size blocks
+/// fit comfortably inside the request-response frame limit, while the sync
+/// loop still requests the next chunk immediately after a full one, so this
+/// constant doubles as the loop's chunk detector.
+pub(crate) const SYNC_BLOCKS_PER_RESPONSE: usize = 8;
 
 /// A token bucket for one message class of one peer. Tokens refill
 /// linearly up to a burst cap; a take succeeds only when enough tokens
@@ -166,11 +167,18 @@ impl RateBucket {
     }
 }
 
+impl Default for RateBucket {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// The four per-peer token buckets — transactions, blocks, onion relays,
 /// and requests — plus the consecutive request-refusal counter the
 /// serving side reads. A peer flooding a single class is throttled in
 /// that class alone. Fields are crate-visible because the handlers
 /// consume them directly.
+#[derive(Default)]
 pub(crate) struct PeerBuckets {
     pub(crate) tx: RateBucket,
     pub(crate) block: RateBucket,
@@ -183,16 +191,6 @@ pub(crate) struct PeerBuckets {
 }
 
 impl PeerBuckets {
-    pub(crate) fn new() -> Self {
-        Self {
-            tx: RateBucket::new(),
-            block: RateBucket::new(),
-            onion: RateBucket::new(),
-            req: RateBucket::new(),
-            req_refusals: 0,
-        }
-    }
-
     /// Admit one transaction message under the transaction bucket.
     pub(crate) fn take_tx(&mut self) -> bool {
         self.tx.take(1.0, TX_BUCKET_REFILL_PER_SEC, TX_BUCKET_BURST)
@@ -230,30 +228,16 @@ impl PeerBuckets {
             .take(cost, REQ_BUCKET_REFILL_PER_SEC, REQ_BUCKET_BURST)
     }
 
-    /// Record one request-bucket refusal and report whether the
-    /// consecutive-refusal count reached the strike threshold.
+    /// Reset the sustained-request-refusal counter after an admitted
+    /// request, because an honest peer may hit a temporary bucket limit.
+    pub(crate) fn clear_req_refusal(&mut self) {
+        self.req_refusals = 0;
+    }
+
+    /// Record one refused request and report whether the refusal ladder
+    /// reached its strike threshold.
     pub(crate) fn note_req_refusal(&mut self) -> bool {
         self.req_refusals = self.req_refusals.saturating_add(1);
         self.req_refusals >= REQ_REFUSAL_STRIKE_THRESHOLD
     }
-
-    /// Clear the consecutive-refusal count after an admitted request:
-    /// the peer is behaving honestly again, and old refusals must not
-    /// stack into a future strike.
-    pub(crate) fn clear_req_refusal(&mut self) {
-        self.req_refusals = 0;
-    }
 }
-
-impl Default for PeerBuckets {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// The bucket tests live in a sibling file: they exercise the private
-/// token balance through the child-module access the path attribute
-/// preserves, keeping this file focused on the limit definitions.
-#[cfg(test)]
-#[path = "limits_tests.rs"]
-mod tests;

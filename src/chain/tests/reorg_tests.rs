@@ -39,15 +39,21 @@ fn reorg_rolls_back_version_bit_activations() {
     // committing anything to the main chain.
     let mut fork = Vec::new();
     let mut prev = chain.block_hash(&fork_base);
-    let mut scratch = chain.state.clone();
+    // The scratch chain state is shared behind an `Arc`; the scratch
+    // working copy detaches the value so it can advance through the
+    // prepared blocks one at a time.
+    let mut scratch = (*chain.state).clone();
     for h in (fork_base.height + 1)..=(fork_base.height + 2) {
         let mut b = test_block(&chain, miner, 0);
         b.height = h;
         b.prev = prev;
         // Install the parent's post-state so the nonce search checks
         // treasury ownership, and preparation executes, against the
-        // state this block meets during the replay.
-        let tip_state = std::mem::replace(&mut chain.state, scratch.clone());
+        // state this block meets during the replay. The installation
+        // re-wraps the scratch copy behind a fresh `Arc` for the
+        // duration of the preparation and restores the shared original
+        // afterwards.
+        let tip_state = std::mem::replace(&mut chain.state, std::sync::Arc::new(scratch.clone()));
         // The nonce search ran against the pre-rewrite header; the
         // fork rewrites height and parent, so the search runs again
         // for the rewritten header before the block is prepared.

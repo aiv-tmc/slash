@@ -81,7 +81,8 @@ impl DaoState {
         // live here rather than in the shape validator because only the
         // submission knows the height the horizon must be measured from.
         if let DaoPayload::EmergencyPause { until_height, .. } = &payload {
-            if *until_height <= height || *until_height > height.saturating_add(DAO_MAX_PAUSE_BLOCKS)
+            if *until_height <= height
+                || *until_height > height.saturating_add(DAO_MAX_PAUSE_BLOCKS)
             {
                 return None;
             }
@@ -144,9 +145,8 @@ impl DaoState {
     /// Tally every proposal whose voting window has ended at `height`,
     /// against the quorum denominator captured at submission, so the tally
     /// is a pure function of the state as it stood when the proposal
-    /// opened and performs no ledger scans. Passed proposals sit in the
-    /// queue for the execution delay so voters can observe the outcome
-    /// before any state change.
+    /// opened and performs no ledger scans. Passed proposals receive their
+    /// executable height.
     pub fn tally_at(&mut self, height: u64) {
         for p in self.proposals.values_mut() {
             if p.status != ProposalStatus::Voting || height < p.end_height {
@@ -168,8 +168,8 @@ impl DaoState {
     /// Execute every passed proposal that reached its executable height.
     /// Execution flows through the same state transition engine as every
     /// other economic primitive; a governance mint additionally pins the
-    /// funded ranges into the provenance set so the minted cells can
-    /// never be sold back through the curve. Marks commit only after
+    /// funded range into the provenance set so the minted cells can
+    /// never be sold back through the curve. The mark commits only after
     /// post-execution ownership confirms the engine moved exactly the
     /// reserved cells to the payload target, so the provenance set can
     /// never diverge from the ledger. Unexecutable payloads expire
@@ -189,32 +189,19 @@ impl DaoState {
             };
             let ok = match &payload {
                 DaoPayload::TreasuryMint { amount, to } => {
-                    // Reserve the main funding range on the pre-execution
+                    // Reserve the funding range on the pre-execution
                     // state: canonical selection is deterministic, so the
                     // reservation equals the range the mint consumes.
                     let main = state.select_single(crate::state::TREASURY, *amount);
                     let ok = execute_payload(state, &payload, height);
                     if ok {
-                        // Pin the main range only when ownership confirms
+                        // Pin the range only when ownership confirms
                         // the mint moved exactly those cells to the target.
                         if let Some((s, e)) = main {
                             if !state.owns(crate::state::TREASURY, s, e, height)
                                 && state.owns(*to, s, e, height)
                             {
                                 self.minted.mark(s, e);
-                            }
-                        }
-                        // The dev-share mint selects on the post-main
-                        // state; reserve and verify it the same way.
-                        let dev = amount.saturating_mul(state.dev_fee_bps) / 10_000;
-                        if dev > 0 {
-                            if let Some((ds, de)) = state.select_single(crate::state::TREASURY, dev)
-                            {
-                                if !state.owns(crate::state::TREASURY, ds, de, height)
-                                    && state.owns(crate::state::DEV_FUND, ds, de, height)
-                                {
-                                    self.minted.mark(ds, de);
-                                }
                             }
                         }
                     }
