@@ -34,7 +34,7 @@ hex = "0.4"
 # The "macros" feature is required: it re-exports the `NetworkBehaviour`
 # derive macro that generates the `BehaviourEvent` enum and the trait
 # implementation for the composite behaviour struct in src/p2p.rs.
-libp2p = { version = "0.54", features = ["tokio", "tcp", "noise", "yamux", "gossipsub", "mdns", "identify", "request-response", "kad", "macros"] }
+libp2p = { version = "0.57", features = ["tokio", "tcp", "noise", "yamux", "gossipsub", "mdns", "identify", "request-response", "kad", "macros"] }
 rand = "0.8"
 rpassword = "7.3"
 rust-randomx = "0.7"
