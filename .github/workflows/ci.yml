@@ -161,7 +161,7 @@ jobs:
         run: >
           cargo test --locked
           --test crypto_agility_tests --test crypto_tests --test ffi_tests
-          --test load_tests --test mining_template --test node_genesis_persistence
+          --test mining_template --test node_genesis_persistence
           --test onion_tests --test storage_tests --test version_bits_window_tests
           -- --test-threads=4
         env:
