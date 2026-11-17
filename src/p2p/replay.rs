@@ -135,7 +135,7 @@ mod tests {
     /// filename, so the test isolates its on-disk image exactly the way
     /// the network test suite does.
     fn in_temp_dir(label: &str, f: impl FnOnce()) {
-        let dir = std::env::temp_dir().join(format!("slash_replay_{label}_{}", std::process::id())); // nosemgrep: rust.lang.security.temp-dir -- unique per-process directory name; contents are non-sensitive duplicate-suppression cache
+        let dir = std::env::temp_dir().join(format!("slash_replay_{label}_{}", std::process::id())); // nosemgrep: rust.lang.security.temp-dir.temp-dir -- unique per-process directory name; contents are non-sensitive duplicate-suppression cache
         std::fs::create_dir_all(&dir).unwrap();
         let prev = std::env::current_dir().unwrap();
         std::env::set_current_dir(&dir).unwrap();

@@ -67,7 +67,7 @@ pub unsafe extern "C" fn slash_init(datadir: *const c_char) -> c_int {
         if datadir.is_null() {
             return -1;
         }
-        let c_str = unsafe { CStr::from_ptr(datadir) }; // nosemgrep: rust.lang.security.unsafe-usage -- audited FFI boundary: raw pointers are the C API contract, validated immediately, panics caught per call
+        let c_str = unsafe { CStr::from_ptr(datadir) }; // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage -- audited FFI boundary: raw pointers are the C API contract, validated immediately, panics caught per call
         let path = match c_str.to_str() {
             Ok(s) => s,
             Err(_) => return -1,
@@ -109,7 +109,7 @@ pub unsafe extern "C" fn slash_generate_encrypted_keypair(password: *const c_cha
             return std::ptr::null_mut();
         }
         let pwd = match unsafe { CStr::from_ptr(password) }.to_str() {
-            // nosemgrep: rust.lang.security.unsafe-usage -- audited FFI boundary: raw pointers are the C API contract, validated immediately, panics caught per call
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage -- audited FFI boundary: raw pointers are the C API contract, validated immediately, panics caught per call
             Ok(s) => s,
             Err(_) => return std::ptr::null_mut(),
         };
@@ -149,12 +149,12 @@ pub unsafe extern "C" fn slash_decrypt_secret(
             return std::ptr::null_mut();
         }
         let wallet_str = match unsafe { CStr::from_ptr(wallet_hex) }.to_str() {
-            // nosemgrep: rust.lang.security.unsafe-usage -- audited FFI boundary: raw pointers are the C API contract, validated immediately, panics caught per call
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage -- audited FFI boundary: raw pointers are the C API contract, validated immediately, panics caught per call
             Ok(s) => s,
             Err(_) => return std::ptr::null_mut(),
         };
         let pwd = match unsafe { CStr::from_ptr(password) }.to_str() {
-            // nosemgrep: rust.lang.security.unsafe-usage -- audited FFI boundary: raw pointers are the C API contract, validated immediately, panics caught per call
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage -- audited FFI boundary: raw pointers are the C API contract, validated immediately, panics caught per call
             Ok(s) => s,
             Err(_) => return std::ptr::null_mut(),
         };
@@ -192,7 +192,7 @@ pub unsafe extern "C" fn slash_get_balance(hex_public: *const c_char) -> c_ulong
         if hex_public.is_null() {
             return 0;
         }
-        let c_str = unsafe { CStr::from_ptr(hex_public) }; // nosemgrep: rust.lang.security.unsafe-usage -- audited FFI boundary: raw pointers are the C API contract, validated immediately, panics caught per call
+        let c_str = unsafe { CStr::from_ptr(hex_public) }; // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage -- audited FFI boundary: raw pointers are the C API contract, validated immediately, panics caught per call
         let hex = match c_str.to_str() {
             Ok(s) => s,
             Err(_) => return 0,
@@ -230,12 +230,12 @@ pub unsafe extern "C" fn slash_sign_transaction(
             return std::ptr::null_mut();
         }
         let secret_str = match unsafe { CStr::from_ptr(hex_secret) }.to_str() {
-            // nosemgrep: rust.lang.security.unsafe-usage -- audited FFI boundary: raw pointers are the C API contract, validated immediately, panics caught per call
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage -- audited FFI boundary: raw pointers are the C API contract, validated immediately, panics caught per call
             Ok(s) => s,
             Err(_) => return std::ptr::null_mut(),
         };
         let payload_str = match unsafe { CStr::from_ptr(hex_payload) }.to_str() {
-            // nosemgrep: rust.lang.security.unsafe-usage -- audited FFI boundary: raw pointers are the C API contract, validated immediately, panics caught per call
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage -- audited FFI boundary: raw pointers are the C API contract, validated immediately, panics caught per call
             Ok(s) => s,
             Err(_) => return std::ptr::null_mut(),
         };
@@ -277,7 +277,7 @@ pub unsafe extern "C" fn slash_sign_transaction(
 pub unsafe extern "C" fn slash_free_string(s: *mut c_char) {
     if !s.is_null() {
         unsafe {
-            // nosemgrep: rust.lang.security.unsafe-usage -- audited FFI boundary: ownership returns to the C caller which must slash_free_string
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage -- audited FFI boundary: ownership returns to the C caller which must slash_free_string
             let _ = CString::from_raw(s);
         }
     }
@@ -287,7 +287,7 @@ pub unsafe extern "C" fn slash_free_string(s: *mut c_char) {
 /// array. Shared by the proof entry point in the child module and any
 /// future fixed-width hex argument.
 pub(crate) fn decode_hex_ptr(ptr: *const c_char) -> anyhow::Result<[u8; 32]> {
-    let c_str = unsafe { CStr::from_ptr(ptr) }; // nosemgrep: rust.lang.security.unsafe-usage -- audited FFI boundary: raw pointers are the C API contract, validated immediately, panics caught per call
+    let c_str = unsafe { CStr::from_ptr(ptr) }; // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage -- audited FFI boundary: raw pointers are the C API contract, validated immediately, panics caught per call
     let hex = c_str.to_str()?;
     crate::decode_key(hex)
 }
