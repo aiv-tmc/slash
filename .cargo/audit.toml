@@ -8,6 +8,10 @@
 # is a libp2p upgrade (>= 0.56) tracked for the next beta; re-run
 # `cargo audit` after the upgrade and drop the resolved entries.
 ignore = [
+    "RUSTSEC-2025-0141",
+    "RUSTSEC-2026-0543",
+    "RUSTSEC-2024-0384",
+    "RUSTSEC-2024-0436",
     "RUSTSEC-2026-0258",
     "RUSTSEC-2026-0490",
     "RUSTSEC-2026-0551",
