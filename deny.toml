@@ -5,10 +5,6 @@ all-features = false
 feature-depth = 1
 
 [advisories]
-# Unmaintained-crate advisories (bincode, chrono, instant, paste) apply
-# only to workspace members, so third-party ecosystem noise must not fail
-# the beta CI; they ride the libp2p >= 0.56 upgrade track.
-unmaintained = "workspace"
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "warn"
@@ -16,6 +12,10 @@ yanked = "warn"
 # Same audited-ignore set as .cargo/audit.toml (see the comment there);
 # drop entries as the libp2p >= 0.56 upgrade lands.
 ignore = [
+    "RUSTSEC-2025-0141",
+    "RUSTSEC-2026-0543",
+    "RUSTSEC-2024-0384",
+    "RUSTSEC-2024-0436",
     "RUSTSEC-2026-0258",
     "RUSTSEC-2026-0490",
     "RUSTSEC-2026-0551",
