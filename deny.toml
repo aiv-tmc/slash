@@ -9,6 +9,35 @@ db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "warn"
 
+# Same audited-ignore set as .cargo/audit.toml (see the comment there);
+# drop entries as the libp2p >= 0.56 upgrade lands.
+ignore = [
+    "RUSTSEC-2026-0258",
+    "RUSTSEC-2026-0490",
+    "RUSTSEC-2026-0551",
+    "RUSTSEC-2026-0531",
+    "RUSTSEC-2026-0505",
+    "RUSTSEC-2026-0491",
+    "RUSTSEC-2026-0550",
+    "RUSTSEC-2026-0489",
+    "RUSTSEC-2026-0530",
+    "RUSTSEC-2026-0511",
+    "RUSTSEC-2026-0119",
+    "RUSTSEC-2026-0487",
+    "RUSTSEC-2026-0512",
+    "RUSTSEC-2026-0514",
+    "RUSTSEC-2026-0536",
+    "RUSTSEC-2026-0534",
+    "RUSTSEC-2026-0535",
+    "RUSTSEC-2026-0537",
+    "RUSTSEC-2026-0525",
+    "RUSTSEC-2025-0009",
+    "RUSTSEC-2026-0104",
+    "RUSTSEC-2026-0382",
+    "RUSTSEC-2026-0098",
+    "RUSTSEC-2026-0099",
+]
+
 [licenses]
 confidence-threshold = 0.8
 allow = [

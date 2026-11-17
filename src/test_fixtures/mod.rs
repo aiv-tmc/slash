@@ -101,7 +101,7 @@ impl TestDir {
                 .map(|d| d.as_nanos())
                 .unwrap_or(0)
         );
-        let temp = std::env::temp_dir().join(unique);
+        let temp = std::env::temp_dir().join(unique);  # nosemgrep: rust.lang.security.temp-dir -- test-only isolation harness; the directory name is generated unique
         std::fs::create_dir_all(&temp).expect("create test directory");
         std::env::set_current_dir(&temp).expect("enter test directory");
         TestDir { previous, temp }
@@ -117,7 +117,7 @@ impl Drop for TestDir {
         // which always exists, then restore the previous directory best
         // effort — if it no longer exists the process stays in the temp
         // directory, which is still a live working directory.
-        let _ = std::env::set_current_dir(std::env::temp_dir());
+        let _ = std::env::set_current_dir(std::env::temp_dir());  # nosemgrep: rust.lang.security.temp-dir -- test-only isolation harness; the directory name is generated unique
         let _ = std::fs::remove_dir_all(&self.temp);
         let _ = std::env::set_current_dir(&self.previous);
         let remaining = TEST_CWD_DEPTH.with(|depth| {
