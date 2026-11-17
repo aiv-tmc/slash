@@ -5,6 +5,9 @@ all-features = false
 feature-depth = 1
 
 [advisories]
+# Unmaintained-crate advisories (bincode, chrono, instant, paste) apply
+# only to workspace members, so third-party ecosystem noise must not fail
+# the beta CI; they ride the libp2p >= 0.56 upgrade track.
 unmaintained = "workspace"
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
