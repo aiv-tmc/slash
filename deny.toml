@@ -5,7 +5,7 @@ all-features = false
 feature-depth = 1
 
 [advisories]
-unmaintained = "warn"
+unmaintained = "workspace"
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "warn"
