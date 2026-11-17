@@ -11,7 +11,6 @@ fn test_tail_slot_emission_is_perpetual() {
     // Pin the perpetual tail: from era 9 onward every block pays the miner
     // exactly one treasury cell through the PoW slot, forever, regardless
     // of how far past the emission schedule the chain advances. See
-    // PERPETUAL_TAIL_EMISSION.md for the decision record.
     for &h in &[9 * slash::chain::HALVING_INTERVAL, 100_000_000u64] {
         let chain = chain_with_next_height(h);
         let miner = [7u8; 32];
