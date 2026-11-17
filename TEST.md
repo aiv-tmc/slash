@@ -179,6 +179,7 @@
 | Rule | Implementation | Test | Status |
 |---|---|---|---|
 | A soak operation stalling mid-flight aborts with the last heartbeat context instead of hanging the binary | `test_fixtures/watchdog.rs::Watchdog`; wired into both soak drivers via `beat` between operations | `test_fixtures/watchdog.rs::tests`; exercised by both soak drivers | Covered |
+| Soak lanes run by default at env-scaled depth (`SLASH_SOAK_OPS`, `SLASH_NETWORK_SOAK_OPS`, `SLASH_NETWORK_SOAK_FORK`) | `tests/soak_invariants_tests`, `tests/soak_network_tests` | `test_mini_soak_invariants`, `test_extended_soak_invariants`, `test_network_soak_mini`, `test_network_soak_extended`, `test_network_soak_probe` | Covered |
 | Nested test-directory guards must not deadlock the process-wide working-directory lock | `test_fixtures/mod.rs::TestDir` per-thread nesting counter holding the single OS-level guard | `test_fixtures::tests::nested_test_dirs_do_not_deadlock` | Covered |
 
 ## Maintenance rules

@@ -108,8 +108,8 @@ pub unsafe extern "C" fn slash_generate_encrypted_keypair(password: *const c_cha
         if password.is_null() {
             return std::ptr::null_mut();
         }
-        let pwd = match unsafe { CStr::from_ptr(password) }.to_str() {
-            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage -- audited FFI boundary: raw pointers are the C API contract, validated immediately, panics caught per call
+        let password_ptr = unsafe { CStr::from_ptr(password) }; // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage -- audited FFI boundary: raw pointers are the C API contract, validated immediately, panics caught per call
+    let pwd = match password_ptr.to_str() {
             Ok(s) => s,
             Err(_) => return std::ptr::null_mut(),
         };
@@ -148,13 +148,13 @@ pub unsafe extern "C" fn slash_decrypt_secret(
         if wallet_hex.is_null() || password.is_null() {
             return std::ptr::null_mut();
         }
-        let wallet_str = match unsafe { CStr::from_ptr(wallet_hex) }.to_str() {
-            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage -- audited FFI boundary: raw pointers are the C API contract, validated immediately, panics caught per call
+        let wallet_ptr = unsafe { CStr::from_ptr(wallet_hex) }; // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage -- audited FFI boundary: raw pointers are the C API contract, validated immediately, panics caught per call
+    let wallet_str = match wallet_ptr.to_str() {
             Ok(s) => s,
             Err(_) => return std::ptr::null_mut(),
         };
-        let pwd = match unsafe { CStr::from_ptr(password) }.to_str() {
-            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage -- audited FFI boundary: raw pointers are the C API contract, validated immediately, panics caught per call
+        let password_ptr = unsafe { CStr::from_ptr(password) }; // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage -- audited FFI boundary: raw pointers are the C API contract, validated immediately, panics caught per call
+    let pwd = match password_ptr.to_str() {
             Ok(s) => s,
             Err(_) => return std::ptr::null_mut(),
         };
@@ -229,13 +229,13 @@ pub unsafe extern "C" fn slash_sign_transaction(
         if hex_secret.is_null() || hex_payload.is_null() {
             return std::ptr::null_mut();
         }
-        let secret_str = match unsafe { CStr::from_ptr(hex_secret) }.to_str() {
-            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage -- audited FFI boundary: raw pointers are the C API contract, validated immediately, panics caught per call
+        let secret_ptr = unsafe { CStr::from_ptr(hex_secret) }; // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage -- audited FFI boundary: raw pointers are the C API contract, validated immediately, panics caught per call
+    let secret_str = match secret_ptr.to_str() {
             Ok(s) => s,
             Err(_) => return std::ptr::null_mut(),
         };
-        let payload_str = match unsafe { CStr::from_ptr(hex_payload) }.to_str() {
-            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage -- audited FFI boundary: raw pointers are the C API contract, validated immediately, panics caught per call
+        let payload_ptr = unsafe { CStr::from_ptr(hex_payload) }; // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage -- audited FFI boundary: raw pointers are the C API contract, validated immediately, panics caught per call
+    let payload_str = match payload_ptr.to_str() {
             Ok(s) => s,
             Err(_) => return std::ptr::null_mut(),
         };
@@ -276,10 +276,7 @@ pub unsafe extern "C" fn slash_sign_transaction(
 #[no_mangle]
 pub unsafe extern "C" fn slash_free_string(s: *mut c_char) {
     if !s.is_null() {
-        unsafe {
-            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage -- audited FFI boundary: ownership returns to the C caller which must slash_free_string
-            let _ = CString::from_raw(s);
-        }
+        let _ = unsafe { CString::from_raw(s) }; // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage -- audited FFI boundary: ownership returns to the C caller which must slash_free_string
     }
 }
 

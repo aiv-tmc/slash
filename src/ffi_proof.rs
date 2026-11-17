@@ -47,8 +47,8 @@ pub unsafe extern "C" fn slash_verify_page_proof(
             Ok(l) => l,
             Err(_) => return 0,
         };
-        let siblings_str = match unsafe { CStr::from_ptr(siblings_json) }.to_str() {
-            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage -- audited FFI boundary: raw pointers are the C API contract, validated immediately, panics caught per call
+        let siblings_ptr = unsafe { CStr::from_ptr(siblings_json) }; // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage -- audited FFI boundary: raw pointers are the C API contract, validated immediately, panics caught per call
+        let siblings_str = match siblings_ptr.to_str() {
             Ok(s) => s,
             Err(_) => return 0,
         };
