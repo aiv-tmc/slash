@@ -1,10 +1,12 @@
 [package]
 name = "slash"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 # Minimum supported Rust version. The codebase relies on integer
-# `is_multiple_of` (1.87) and `Option::is_none_or` (1.82).
-rust-version = "1.87"
+# `is_multiple_of` (1.87) and `Option::is_none_or` (1.82); the floor is
+# 1.88 because the icu dependencies of the networking stack declare that
+# as their MSRV.
+rust-version = "1.88"
 autobenches = false
 autotests = true
 
@@ -56,6 +58,15 @@ anyhow = "1.0"
 # dev profile pins the library too.
 [profile.dev.package.rust-randomx]
 opt-level = 3
+
+# Test execution speed is part of the CI budget: the library and every
+# integration test target compile at O2 in the dev profile so the
+# hashing and state-machine hot paths do not run interpreter-slow, while
+# dependencies below keep the default O0 and build quickly. Debug
+# assertions stay on: consensus checks must run exactly as they do in
+# the default dev profile.
+[profile.dev.package.slash]
+opt-level = 2
 
 # Thin LTO across the crate graph plus a single codegen unit recovers
 # 10-25% on the hashing and serialization hot paths (sighash, page
@@ -134,6 +145,10 @@ path = "tests/wire_format_tests/main.rs"
 # The Criterion harness requires a single entry point. The measurements
 # live in the benches/ modules so every file stays readable;
 # the runner itself only wires the groups together.
+[[bin]]
+name = "slash-node"
+path = "src/main.rs"
+
 [[bench]]
 name = "benchmarks"
 harness = false

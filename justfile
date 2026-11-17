@@ -25,6 +25,10 @@ test-slow:
     cargo test --locked --test soak_invariants_tests -- --test-threads=2
     cargo test --locked --test soak_network_tests -- --test-threads=2
 
+soak-full:
+    SLASH_SOAK_OPS=100000 SLASH_NETWORK_SOAK_OPS=600 SLASH_NETWORK_SOAK_FORK=8 cargo test --locked --test soak_invariants_tests -- --test-threads=2
+    SLASH_NETWORK_SOAK_OPS=600 SLASH_NETWORK_SOAK_FORK=8 cargo test --locked --test soak_network_tests -- --test-threads=2
+
 docs:
     RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features --locked --open
 

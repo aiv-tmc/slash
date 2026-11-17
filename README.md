@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/slash-protocol/slash/actions/workflows/ci.yml/badge.svg)](https://github.com/slash-protocol/slash/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.87%2B-orange.svg)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
 
 A cell-based blockchain with RandomX proof-of-work, paged multi-input state (PMIS), adaptive governance via version bits, layered onion routing for transaction privacy, and a cell-denominated bonding-curve treasury with a halving emission schedule.
 
@@ -58,7 +58,7 @@ Consensus is secured by **RandomX proof-of-work**, ensuring CPU-friendly and ASI
 
 ## Build Requirements
 
-- **Rust** 1.87 or later
+- **Rust** 1.88 or later
 - **Cargo**
 - **OpenSSL development headers** (for libp2p noise protocol)
 - **CMake** (for RandomX VM compilation)
@@ -230,8 +230,8 @@ A C-compatible API is provided for hardware wallet and mobile integration:
 
 ## Network Identifiers
 
-- **Mainnet**: `/slash/0.7.0`
-- **Testnet**: `/slash/test/0.7.0`
+- **Mainnet**: `/slash/0.8.0`
+- **Testnet**: `/slash/test/0.8.0`
 
 The `TESTNET_MODE` atomic boolean switches signature hashing between the two chain IDs, preventing replay across networks.
 

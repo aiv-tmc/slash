@@ -18,7 +18,7 @@ Thank you for your interest in contributing. This document outlines the process 
 
 ### Prerequisites
 
-- Rust 1.87 or later (`rustup update stable`)
+- Rust 1.88 or later (`rustup update stable`)
 - Cargo
 - CMake, OpenSSL headers, pkg-config
 

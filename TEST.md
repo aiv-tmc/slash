@@ -1,6 +1,6 @@
 # Slash Protocol — Test Coverage Matrix
 
-**Version:** 0.7.0
+**Version:** 0.8.0
 **Status:** authoritative. A documented rule without a row in this matrix is treated as not implemented. Every consensus change must update this matrix in the same pull request.
 
 ## Legend
@@ -99,6 +99,7 @@
 | Treasury sig required at any non-coinbase position | `chain.rs::Chain::execute_block_txs` | `era_nine_boundary_tests` position-zero case | Covered |
 | Signed unpaired mint rejected (era 9, position 0) | `chain.rs::Chain::execute_block_txs` | `era_nine_boundary_tests` signed-unpaired case | Covered |
 | Sell quote with zero payout refused | `rpc/quotes.rs::handle_build_treasury_sell` | `rpc` quote cases | Specified |
+| A treasury-bound transaction moves exactly the curve width plus the mandatory-fee floor (`total_out / 200`); declared change/fee outputs beyond the floor are not executed and the residual input returns to the sender | `state/transfer.rs::tx` treasury-bound gate | `treasury_tests` buy/sell pairing cases | Covered |
 | DAO-minted cells carry no curve buy-back rights | `dao/state.rs::DaoState::execute_due` (provenance pinning); `state/transfer.rs::tx` (treasury-bound output gate) | `dao_tests::dao_minted_cells_refuse_curve_sellback`; `dao/types.rs::provenance_tests` | Covered |
 
 ## 5. Governance and dev fund
@@ -158,6 +159,8 @@
 | Manifest + crash-recovery journal; replay stops at the first refused record | `storage.rs`; `load.rs::recover` | `storage_tests`; `reorg_persistence_tests` | Covered |
 | Load-time sanity package (height coordinate, contiguity, checkpoints, cache sum) | `load_sanity.rs::sanity_check` | `load_sanity.rs` tests | Covered |
 | Pruned recovery replay bounded | `chain.rs::HISTORY_REBUILD_MAX_REPLAY` | `reorg_persistence_tests` | Covered |
+| Pruned recovery anchors at the snapshot, seeds the window with the anchor block for linkage, and replays only blocks stored above the anchor | `load.rs::load_pruned` snapshot fallback | `storage_tests::test_load_pruned_recovers_from_snapshot` | Covered |
+| An output lock binds only while its expiry strictly exceeds the executing height; an inert lock is refused | `state/transfer.rs::stage_transfer` inert-lock gate | `state/transfer/staging.rs::inert_lock_refused_at_the_executing_height` | Covered |
 | Dev-fund/DAO state survives restart | `storage.rs::Header` | `storage_tests` round-trip | Specified |
 | Ed25519 round-trip | `crypto.rs` | `crypto_tests` | Covered |
 | X25519 shared-secret rejection of low-order points | `crypto.rs::x25519_shared` | `crypto_tests::test_x25519_shared_rejects_low_order_public_key` | Covered |
@@ -169,9 +172,17 @@
 | FFI wallet flow: encrypted keypair generation and decryption | `ffi.rs::slash_generate_encrypted_keypair`, `slash_decrypt_secret` | `ffi_tests::wallet_round_trip_via_ffi` | Covered |
 | FFI proof verification bounds siblings and index | `ffi.rs::slash_verify_page_proof` | `ffi_tests::proof_verification_rejects_oversized_input` | Covered |
 
+## 8. Test infrastructure
+
+| Rule | Implementation | Test | Status |
+|---|---|---|---|
+| A soak operation stalling mid-flight aborts with the last heartbeat context instead of hanging the binary | `test_fixtures/watchdog.rs::Watchdog`; wired into both soak drivers via `beat` between operations | `test_fixtures/watchdog.rs::tests`; exercised by both soak drivers | Covered |
+| Nested test-directory guards must not deadlock the process-wide working-directory lock | `test_fixtures/mod.rs::TestDir` per-thread nesting counter holding the single OS-level guard | `test_fixtures::tests::nested_test_dirs_do_not_deadlock` | Covered |
+
 ## Maintenance rules
 
 - Every new consensus rule enters with both validation paths (mempool and block execution) named.
 - Every bug fix enters with its regression test named.
 - Rows are never deleted; closed items move to the appendix with the closing change named.
 - CPU-heavy consensus walks (full retarget interval, history-window growth, lock-expiry walks) live in the `slow_chain_tests` integration target and run with limited test threads; the matrix names the target for every row they cover.
+- Long-running drivers (soak suites, stress harnesses) report progress through `Watchdog::beat` at least once per operation; any new long-running driver must do the same.
