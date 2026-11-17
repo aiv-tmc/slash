@@ -33,7 +33,7 @@ Consensus is secured by **RandomX proof-of-work**, ensuring CPU-friendly and ASI
 
 ### Emission Schedule
 - **Coinbase subsidy** of 500 cells per block at genesis, halving every 4 years (420,480 blocks at a 300-second target).
-- Nine eras; total emission **417,957,120 cells (~41.8 % of supply)** over ~36 years. From era 9 on, miner revenue is transaction fees **plus the perpetual one-cell slot tail** paid every block forever — the slot mint never stops (see `PERPETUAL_TAIL_EMISSION.md` for the decision record).
+- Nine eras; total emission **417,957,120 cells (~41.8 % of supply)** over ~36 years. From era 9 on, miner revenue is transaction fees **plus the perpetual one-cell slot tail** paid every block forever — the slot mint never stops.
 - Coinbase is a mandatory `txs[0]` treasury transaction paying the miner exactly `subsidy_at(height)`; all other treasury transactions require the treasury signer key.
 
 ### Governance (Version Bits)
@@ -250,7 +250,7 @@ The `TESTNET_MODE` atomic boolean switches signature hashing between the two cha
 | 8 | 3,363,840 – 3,784,319 | 1 | 420,480 |
 | 9+ | from 3,784,320 | 0 | 0 |
 
-Total: **417,957,120 cells (~41.8 % of N)**. From era 9 onward the miner still receives exactly one slot cell per block, forever; see `PERPETUAL_TAIL_EMISSION.md` and `SLASH_EMISSION_AND_TREASURY_DESIGN.md` for the full specifications.
+Total: **417,957,120 cells (~41.8 % of N)**. From era 9 onward the miner still receives exactly one slot cell per block, forever.
 
 ## Security
 

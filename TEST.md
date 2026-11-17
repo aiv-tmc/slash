@@ -171,6 +171,8 @@
 | FFI datadir selection without working-directory mutation | `storage::set_data_dir`; `ffi.rs::slash_init` | `ffi_tests::datadir_selection_does_not_touch_cwd` | Covered |
 | FFI wallet flow: encrypted keypair generation and decryption | `ffi.rs::slash_generate_encrypted_keypair`, `slash_decrypt_secret` | `ffi_tests::wallet_round_trip_via_ffi` | Covered |
 | FFI proof verification bounds siblings and index | `ffi.rs::slash_verify_page_proof` | `ffi_tests::proof_verification_rejects_oversized_input` | Covered |
+| Mining template validates through the nonce-independent gate before grinding | `chain/validation/block.rs::Chain::validate_block_template`; `chain/execution/mod.rs::Chain::execute_block_template` | `mining_template.rs::mining_template_validates_before_the_nonce_exists` | Covered |
+| Node genesis anchor round-trips the balance cache through save and load | `load.rs::load_pruned` (snapshot fallback anchor) | `node_genesis_persistence.rs::genesis_manifest_round_trips_the_balance_cache` | Covered |
 
 ## 8. Test infrastructure
 
