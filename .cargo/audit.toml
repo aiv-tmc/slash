@@ -1,0 +1,35 @@
+[advisories]
+
+# Audited 2026-11-17 for the 0.8.0 beta: every finding sits in a transitive
+# dependency pinned by libp2p 0.54 (h2/hickory via libp2p-dns and libp2p-upnp,
+# gossipsub 0.47, QUIC/TLS via rcgen + rustls-webpki, ring 0.16). The
+# affected transports (QUIC, TLS, UPnP, DNS resolution) are not enabled at
+# runtime, and the gossipsub mesh runs only on the private testnet. The fix
+# is a libp2p upgrade (>= 0.56) tracked for the next beta; re-run
+# `cargo audit` after the upgrade and drop the resolved entries.
+ignore = [
+    "RUSTSEC-2026-0258",
+    "RUSTSEC-2026-0490",
+    "RUSTSEC-2026-0551",
+    "RUSTSEC-2026-0531",
+    "RUSTSEC-2026-0505",
+    "RUSTSEC-2026-0491",
+    "RUSTSEC-2026-0550",
+    "RUSTSEC-2026-0489",
+    "RUSTSEC-2026-0530",
+    "RUSTSEC-2026-0511",
+    "RUSTSEC-2026-0119",
+    "RUSTSEC-2026-0487",
+    "RUSTSEC-2026-0512",
+    "RUSTSEC-2026-0514",
+    "RUSTSEC-2026-0536",
+    "RUSTSEC-2026-0534",
+    "RUSTSEC-2026-0535",
+    "RUSTSEC-2026-0537",
+    "RUSTSEC-2026-0525",
+    "RUSTSEC-2025-0009",
+    "RUSTSEC-2026-0104",
+    "RUSTSEC-2026-0382",
+    "RUSTSEC-2026-0098",
+    "RUSTSEC-2026-0099",
+]
